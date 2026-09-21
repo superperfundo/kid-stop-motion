@@ -1,0 +1,16 @@
+# Captured frames and exported movies stay on your own machine
+stopmotion_project_*/
+stop_motion_export*.mp4
+stopmotion_*.mp4
+*.mp4
+frame_*.png
+
+# Environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Editors / OS
+.vscode/
+.DS_Store
