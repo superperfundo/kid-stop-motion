@@ -25,9 +25,10 @@ import time
 from pathlib import Path
 from datetime import datetime
 
-# Set to True if your camera is mounted upside down and the picture comes
-# out inverted.
-ROTATE_180 = False
+# Most tabletop rigs end up with the camera clamped upside down, so the
+# picture is rotated by default. Set this to False if yours comes out
+# inverted.
+ROTATE_180 = True
 
 FPS = 12
 

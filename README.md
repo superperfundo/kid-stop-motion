@@ -42,7 +42,8 @@ On Debian/Ubuntu: `sudo apt install ffmpeg`. On Windows, see the ffmpeg download
 python3 stopmotion.py
 ```
 
-A window opens showing the live camera with the controls along the top.
+A window opens showing the live camera with the controls along the top. If the picture is upside
+down, see [Settings](#settings) — there's a one-line switch for that.
 
 | Key | What it does |
 | --- | --- |
@@ -74,7 +75,9 @@ named with a timestamp.
 Near the top of `stopmotion.py`:
 
 - `FPS = 12` — frames per second of the exported movie.
-- `ROTATE_180 = False` — set to `True` if your camera is mounted upside down.
+- `ROTATE_180 = True` — the picture is rotated half a turn by default, because most tabletop rigs
+  end up with the camera clamped upside down. **If your picture appears upside down, set this to
+  `False`.**
 
 ## Camera permissions
 
