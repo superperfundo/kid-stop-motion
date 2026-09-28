@@ -1,1 +1,2 @@
 opencv-python
+libusb-package; sys_platform == "darwin"
