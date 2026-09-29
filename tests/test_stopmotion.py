@@ -68,6 +68,20 @@ class ProjectFileTests(TempDirTest):
         p = sm.Project.create("Movie", self.tmp)
         self.assertEqual(sm.Project.open(p.folder).path, p.path)
 
+    def test_open_from_any_file_in_the_project(self):
+        p = sm.Project.create("Movie", self.tmp)
+        with p.change():
+            p.add_frame(solid(RED), 0)
+        self.assertEqual(sm.Project.open(p.file_path(p.items[0]["file"])).path, p.path)
+        launcher = sm.write_launcher(p)
+        self.assertEqual(sm.Project.open(launcher).path, p.path)
+
+    def test_renaming_the_file_renames_the_movie(self):
+        p = sm.Project.create("Movie", self.tmp)
+        renamed = p.path.with_name("Dragon.stopmo")
+        p.path.rename(renamed)
+        self.assertEqual(sm.Project.open(renamed).name, "Dragon")
+
     def test_open_rejects_other_files(self):
         other = self.tmp / "notes.txt"
         other.write_text("hi")

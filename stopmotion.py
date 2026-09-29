@@ -153,6 +153,10 @@ def even_size(w, h):
     return max(2, int(w) // 2 * 2), max(2, int(h) // 2 * 2)
 
 
+def plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
 def clamp(value, low, high):
     return max(low, min(high, value))
 
@@ -268,7 +272,8 @@ class Project:
 
     @property
     def name(self):
-        return self.doc.get("name") or self.path.stem
+        # The file's name, so renaming it in Finder / Explorer renames the movie.
+        return self.path.stem
 
     @property
     def items(self):
@@ -310,14 +315,20 @@ class Project:
         return project
 
     @classmethod
-    def open(cls, path):
+    def open(cls, path, projects_dir=None):
+        """Open a .stopmo file - or a project folder, or any file inside one."""
         path = Path(path).expanduser().absolute()
+        if path.is_file() and path.suffix.lower() != PROJECT_EXT:
+            for folder in (path.parent, path.parent.parent):
+                if any(folder.glob("*" + PROJECT_EXT)):
+                    path = folder
+                    break
         if path.is_dir():
             found = sorted(path.glob("*" + PROJECT_EXT), key=lambda p: p.stat().st_mtime, reverse=True)
             if found:
                 path = found[0]
             elif list(path.glob("frame_*.png")):
-                return cls.import_legacy(path)
+                return cls.import_legacy(path, projects_dir)
             elif (path / FRAMES_DIR).is_dir():
                 path = path / (path.name + PROJECT_EXT)
             else:
@@ -541,7 +552,7 @@ class Project:
         yield
         if self.edit_state() != before:
             self.undo_stack.append((before, ui))
-            del self.undo_stack[:-200]
+            del self.undo_stack[:-100]
             self.redo_stack.clear()
             self.save()
 
@@ -1589,16 +1600,13 @@ class App:
         self.countdown_seconds = 3
         self._shift = False
         self._caps = False
+        self._audio_len = (None, None)
 
     # -- running
 
     def run(self, open_path=None):
-        if open_path:
-            try:
-                self.set_project(Project.open(open_path))
-            except (ProjectError, OSError) as e:
-                print(f"Couldn't open {open_path}: {e}")
-                self.toast(f"Couldn't open that project: {e}", "error", 6)
+        if open_path and not self.open_path(open_path):
+            print(f"Couldn't open {open_path}: {self.toast_text}")
         if self.project is None and not self.pick_project(startup=True):
             return
         self.studio()
@@ -1860,7 +1868,7 @@ class App:
         fill_rect(c, 0, 0, CANVAS_W, TOP_H, C_BAR)
         p = self.project
         seconds = len(build_plan(p)) / p.fps
-        stats = f"{p.frame_count()} pictures    {seconds:.1f} seconds    {p.fps} per second"
+        stats = f"{plural(p.frame_count(), 'picture')}    {seconds:.1f} seconds    {p.fps} per second"
         if p.audio_file():
             stats += "    + voice"
         stats_w = put_text(c, stats, (VIEW_W - 16, 32), 0.55, C_DIM, 1, align="right")
@@ -1915,7 +1923,9 @@ class App:
             round_rect(c, bx0, by0, bx1, by1, C_DARK, 14)
             if done:
                 round_rect(c, bx0, by0, bx0 + max(28, int((bx1 - bx0) * min(1.0, done / goal))), by1, C_GREEN, 14)
-            text = f"Goal: {done} / {goal} pictures" if done < goal else f"Goal reached!  {done} / {goal} pictures"
+            text = f"Goal: {done} / {plural(goal, 'picture')}"
+            if done >= goal:
+                text = "Goal reached!  " + text[6:]
             put_text(c, text, ((bx0 + bx1) // 2, (by0 + by1) // 2), 0.55, WHITE, 1, UI_BOLD, align="center", valign="middle")
             bottom = by0 - 8
         hint = None
@@ -1965,7 +1975,7 @@ class App:
         if path is None:
             return None
         key = (str(path), path.stat().st_mtime)
-        if getattr(self, "_audio_len", (None, None))[0] != key:
+        if self._audio_len[0] != key:
             try:
                 with wave.open(str(path), "rb") as w:
                     self._audio_len = (key, w.getnframes() / w.getframerate())
@@ -2186,7 +2196,7 @@ class App:
         count, goal = self.project.frame_count(), self.project.doc.get("frame_goal") or 0
         print(f"Captured picture {count}" + (f" / {goal}" if goal else ""))
         if goal and count == goal:
-            self.toast(f"Goal reached! {goal} pictures!", "good", 4)
+            self.toast(f"Goal reached! {plural(goal, 'picture')}!", "good", 4)
 
     def cmd_enter(self):
         if self.cursor is not None and self.project.items[self.cursor]["kind"] == "title":
@@ -2382,7 +2392,7 @@ class App:
         goal = int(text) if text.isdigit() else 0
         p.set_option("frame_goal", goal)
         if goal:
-            self.toast(f"Goal: {goal} pictures. {max(goal - p.frame_count(), 0)} to go!", "good")
+            self.toast(f"Goal: {plural(goal, 'picture')}. {max(goal - p.frame_count(), 0)} to go!", "good")
         else:
             self.toast("Goal cleared.")
 
@@ -2448,20 +2458,22 @@ class App:
         audio = self.load_audio()
         shown, view = -1, None
         start = self.start_playback(audio)
-        while self.running:
-            idx = int((time.monotonic() - start) * p.fps)
-            if idx >= len(plan):          # go round again, like a flip book
-                self.speaker.stop()
-                start = self.start_playback(audio)
-                idx = 0
-            if idx != shown:
-                view = fit_image(self.renderer.render(plan[idx]), (VIEW_W, VIEW_H))
-                shown = idx
-            c = self.draw_studio(view, "preview", plan_item(plan[idx]), {"progress": (idx + 1) / len(plan)})
-            key, events = self.tick(c, 5)
-            if key != -1 or any(e[0] == "down" for e in events):
-                break
-        self.speaker.stop()
+        try:
+            while self.running:
+                idx = int((time.monotonic() - start) * p.fps)
+                if idx >= len(plan):          # go round again, like a flip book
+                    self.speaker.stop()
+                    start = self.start_playback(audio)
+                    idx = 0
+                if idx != shown:
+                    view = fit_image(self.renderer.render(plan[idx]), (VIEW_W, VIEW_H))
+                    shown = idx
+                c = self.draw_studio(view, "preview", plan_item(plan[idx]), {"progress": (idx + 1) / len(plan)})
+                key, events = self.tick(c, 5)
+                if key != -1 or any(e[0] == "down" for e in events):
+                    break
+        finally:
+            self.speaker.stop()
         self.after_modal()
 
     # -- recording a voice track
@@ -2696,13 +2708,18 @@ class App:
         """options: [(key name, label)]. Returns the chosen key name, or None."""
         c = self.backdrop()
         self.hotspots = []
-        bx0, by0, bx1, by1 = 220, 230, CANVAS_W - 220, 510
+        bx0, bx1 = 220, CANVAS_W - 220
+        lines = wrap_text(message, bx1 - bx0 - 80, 0.9)
+        details = wrap_text(detail, bx1 - bx0 - 80, 0.55)[:3] if detail else []
+        height = 58 + 42 * len(lines) + 28 * len(details) + 100
+        by0 = (CANVAS_H - height) // 2
+        by1 = by0 + height
         round_rect(c, bx0, by0, bx1, by1, C_BAR, 16)
         y = by0 + 58
-        for line in wrap_text(message, bx1 - bx0 - 80, 0.9):
+        for line in lines:
             put_text(c, line, (CANVAS_W // 2, y), 0.9, WHITE, 2, UI_BOLD, align="center")
             y += 42
-        for line in wrap_text(detail or "", bx1 - bx0 - 80, 0.55)[:3]:
+        for line in details:
             put_text(c, line, (CANVAS_W // 2, y), 0.55, C_DIM, 1, UI_BOLD, align="center")
             y += 28
         n = len(options)
@@ -2821,7 +2838,7 @@ class App:
                     info = "needs fixing - open it to repair"
                 else:
                     when = datetime.fromtimestamp(entry["modified"]).strftime("%b %d")
-                    info = f"{entry['frames']} pictures   {entry['seconds']:.1f}s   {when}"
+                    info = f"{plural(entry['frames'], 'picture')}   {entry['seconds']:.1f}s   {when}"
                 put_text(c, info, (x + 4, y + PICK_H + 47), 0.45, C_DIM)
                 if entry["kind"] == "legacy":
                     pill(c, "OLD SAVE", x + 6, y + 6, C_ORANGE, C_DARK, 0.45)
@@ -2933,7 +2950,7 @@ class App:
 
     def open_path(self, path):
         try:
-            project = Project.open(path)
+            project = Project.open(path, self.projects_dir)
         except (ProjectError, OSError) as e:
             self.toast(f"Couldn't open that: {e}", "error", 6)
             return False
