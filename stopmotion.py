@@ -21,8 +21,10 @@ Run:  python3 stopmotion.py [path/to/Movie.stopmo]
 """
 
 import argparse
+import errno
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -75,6 +77,7 @@ FRAMES_DIR = "frames"
 AUDIO_DIR = "audio"
 BACKUPS_DIR = "backups"
 TRASH_DIR = "trash"
+LOCK_FILE = ".in-use"
 FRAME_EXT = ".jpg"
 JPEG_QUALITY = 95
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
@@ -213,6 +216,12 @@ def valid_transition(tr):
             and isinstance(tr.get("frames"), int) and 1 <= tr["frames"] <= 240)
 
 
+def backup_time(path):
+    """When a backup was made, from its name ("Movie 2026-09-29 13-14-05.stopmo")."""
+    found = re.search(r"\d{4}-\d\d-\d\d \d\d-\d\d-\d\d", Path(path).stem)
+    return found.group(0) if found else Path(path).stem
+
+
 def file_number(path):
     stem = Path(path).stem.split(" ")[0]
     return int(stem) if stem.isdigit() else 0
@@ -265,6 +274,7 @@ class Project:
         self.redo_stack = []
         self.notes = []            # things to tell the user after opening
         self._last_backup = float("-inf")
+        self._lock_file = None
 
     @property
     def folder(self):
@@ -323,6 +333,10 @@ class Project:
                 if any(folder.glob("*" + PROJECT_EXT)):
                     path = folder
                     break
+        if path.parent.name == BACKUPS_DIR and (path.parent.parent / FRAMES_DIR).is_dir():
+            return cls._restore_backup(path)
+        if path.suffix.lower() == PROJECT_EXT and not path.exists() and path.parent.is_dir():
+            path = path.parent          # e.g. it was renamed: open the project file that's there now
         if path.is_dir():
             found = sorted(path.glob("*" + PROJECT_EXT), key=lambda p: p.stat().st_mtime, reverse=True)
             if found:
@@ -349,12 +363,26 @@ class Project:
             project.notes.append("The project file was missing or damaged, so it was rebuilt from the pictures.")
             changed = True
         elif source != path:
-            project.notes.append(f"The project file was damaged, so its backup ({source.stem[-19:]}) was used.")
+            project.notes.append(f"The project file was damaged, so its backup ({backup_time(source)}) was used.")
             project._recover_orphans()
             changed = True
         changed = project._repair() or changed
         if changed:
             project.save()
+        return project
+
+    @classmethod
+    def _restore_backup(cls, backup):
+        """Opening a file from backups/ goes back to it - as an ordinary change,
+        so Z (undo) returns to how things were."""
+        doc = cls.load_doc(backup)
+        if doc is None:
+            raise ProjectError(f"{backup.name} is damaged")
+        project = cls.open(backup.parent.parent)
+        with project.change():
+            project.doc.update({k: doc.get(k, project.doc.get(k)) for k in cls.EDIT_KEYS})
+            project._repair()
+        project.notes.append(f"Went back to the backup from {backup_time(backup)}. Press Z to undo that.")
         return project
 
     @classmethod
@@ -452,9 +480,10 @@ class Project:
                 continue
             kind = item.get("kind")
             if kind == "frame":
-                if not isinstance(item.get("file"), str) or not self._ensure_file(item["file"]):
-                    missing += 1
+                if not isinstance(item.get("file"), str):
                     continue
+                if not self._ensure_file(item["file"]):
+                    missing += 1          # kept (shown as a grey card) in case the file turns up again
                 default_hold = 1
             elif kind == "title":
                 lines = item.get("lines")
@@ -485,8 +514,11 @@ class Project:
         highest = max((file_number(p) for p in self._picture_files() + self._picture_files(TRASH_DIR)), default=0)
         if not isinstance(doc["next_frame"], int) or doc["next_frame"] <= highest:
             doc["next_frame"] = highest + 1
+        if not isinstance(doc["frame_goal"], int) or doc["frame_goal"] < 0:
+            doc["frame_goal"] = 0
+        doc["onion_skin"] = bool(doc["onion_skin"])
         if missing:
-            self.notes.append(f"{missing} missing picture(s) were skipped.")
+            self.notes.append(f"{plural(missing, 'picture')} can't be found (shown as grey cards).")
         return json.dumps(doc, sort_keys=True) != before
 
     # -- saving
@@ -495,13 +527,20 @@ class Project:
         self.doc["modified"] = datetime.now().isoformat(timespec="seconds")
         data = json.dumps(self.doc, indent=1).encode("utf-8")
         if self.path.exists() and (backup or time.monotonic() - self._last_backup >= BACKUP_EVERY_SECONDS):
-            self._backup()
+            try:
+                self._backup()
+            except OSError as e:
+                self._last_backup = time.monotonic()
+                print(f"Couldn't make a backup copy ({e}); saving anyway.")
         atomic_write(self.path, data)
 
     def _backup(self):
         folder = self.folder / BACKUPS_DIR
         folder.mkdir(exist_ok=True)
-        shutil.copy2(self.path, folder / f"{self.path.stem} {now_stamp()}{PROJECT_EXT}")
+        name, n = f"{self.path.stem} {now_stamp()}", 2
+        while (folder / (name + PROJECT_EXT)).exists():
+            name, n = f"{self.path.stem} {now_stamp()} ({n})", n + 1
+        shutil.copy2(self.path, folder / (name + PROJECT_EXT))
         self._last_backup = time.monotonic()
         old = sorted(folder.glob("*" + PROJECT_EXT), key=lambda p: p.stat().st_mtime)
         for extra in old[:-KEEP_BACKUPS]:
@@ -514,9 +553,14 @@ class Project:
 
     def tidy(self):
         """Move pictures and sounds nothing uses any more into trash/."""
-        used = {it["file"] for it in self.items if it["kind"] == "frame"}
-        if self.doc.get("audio"):
-            used.add(self.doc["audio"]["file"])
+        used = set()
+        docs = [self.doc] + [Project.load_doc(p) for p in self.folder.glob("*" + PROJECT_EXT) if p != self.path]
+        for doc in docs:              # a copy or renamed project file may share this folder
+            if not doc:
+                continue
+            used |= {it.get("file") for it in doc["items"] if isinstance(it, dict) and it.get("kind") == "frame"}
+            if isinstance(doc.get("audio"), dict):
+                used.add(doc["audio"].get("file"))
         trash = self.folder / TRASH_DIR
         moved = 0
         for sub in (FRAMES_DIR, AUDIO_DIR):
@@ -534,6 +578,7 @@ class Project:
                 if dest.exists():
                     dest = trash / f"{path.stem} {new_id()[:4]}{path.suffix}"
                 shutil.move(str(path), str(dest))
+                os.utime(dest)            # so the trash forgets the oldest *deleted* files first
                 moved += 1
         if trash.is_dir():
             old = sorted((p for p in trash.iterdir() if p.is_file()), key=lambda p: p.stat().st_mtime)
@@ -573,8 +618,39 @@ class Project:
 
     def _next_frame_rel(self, ext=FRAME_EXT):
         n = self.doc["next_frame"]
+        while any((self.folder / sub / f"{n:06d}{ext}").exists() for sub in (FRAMES_DIR, TRASH_DIR)):
+            n += 1                        # never write over a picture that's already there
         self.doc["next_frame"] = n + 1
         return f"{FRAMES_DIR}/{n:06d}{ext}"
+
+    def lock(self):
+        """Stop one movie being open in two windows at once (they would write over
+        each other). The computer lets go of the lock by itself if we crash.
+        Returns False if another window has it."""
+        try:
+            f = open(self.folder / LOCK_FILE, "a+")
+        except OSError:
+            return True                   # e.g. a read-only folder: carry on without a lock
+        try:
+            if os.name == "nt":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            if isinstance(e, (BlockingIOError, PermissionError)) or e.errno in (errno.EACCES, errno.EAGAIN,
+                                                                               errno.EDEADLK):
+                f.close()
+                return False
+        self._lock_file = f
+        return True
+
+    def unlock(self):
+        if self._lock_file is not None:
+            self._lock_file.close()
+            self._lock_file = None
 
     def add_frame(self, image, index):
         ok, buf = cv2.imencode(FRAME_EXT, image, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
@@ -835,11 +911,14 @@ def write_wav(path, samples, samplerate):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    with wave.open(str(tmp), "wb") as w:
-        w.setnchannels(samples.shape[1])
-        w.setsampwidth(2)
-        w.setframerate(int(samplerate))
-        w.writeframes(samples.tobytes())
+    with open(tmp, "wb") as f:
+        with wave.open(f, "wb") as w:
+            w.setnchannels(samples.shape[1])
+            w.setsampwidth(2)
+            w.setframerate(int(samplerate))
+            w.writeframes(samples.tobytes())
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
 
 
@@ -958,8 +1037,11 @@ def export_movie(project, out_path, progress=None):
                 try:
                     for img in frames():
                         proc.stdin.write(img.tobytes())
-                except BrokenPipeError:
-                    pass                  # ffmpeg stopped early; its error message says why
+                except OSError as e:
+                    # ffmpeg stopped early (Windows calls that EINVAL); its error message says why.
+                    if not isinstance(e, BrokenPipeError) and e.errno != errno.EINVAL:
+                        proc.kill()
+                        raise
                 except BaseException:
                     proc.kill()
                     raise
@@ -987,6 +1069,9 @@ def export_movie(project, out_path, progress=None):
     except KeyboardInterrupt:
         part.unlink(missing_ok=True)
         return False, "Stopped making the movie."
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
     os.replace(part, out_path)
     return True, note
 
@@ -1040,26 +1125,35 @@ def ask_open_path(initial_dir):
     return None, None
 
 
+LAUNCHER_MARK = "in Kid Stop Motion"
+
+
 def write_launcher(project):
-    """Put a double-clickable "Open <movie>" file next to the project file."""
+    """Put a double-clickable "Open <movie>" file next to the project file.
+    It opens the folder rather than naming the file, so it keeps working if
+    the project file is renamed."""
     if not WRITE_LAUNCHERS:
         return None
     script = Path(__file__).resolve()
-    name = project.path.name
     if os.name != "nt":
         ext = ".command" if sys.platform == "darwin" else ".sh"
         content = ("#!/bin/sh\n"
-                   f"# Double-click to open \"{project.name}\" in Kid Stop Motion.\n"
+                   f"# Double-click to open this movie {LAUNCHER_MARK}.\n"
                    'cd "$(dirname "$0")" || exit 1\n'
-                   f"exec {shlex.quote(sys.executable)} {shlex.quote(str(script))} {shlex.quote(name)}\n")
+                   f"exec {shlex.quote(sys.executable)} {shlex.quote(str(script))} .\n")
     else:
         ext = ".bat"
+        python, script = (str(path).replace("%", "%%") for path in (sys.executable, script))
         content = ("@echo off\r\n"
-                   f"rem Double-click to open \"{project.name}\" in Kid Stop Motion.\r\n"
+                   "chcp 65001 >nul\r\n"
+                   f"rem Double-click to open this movie {LAUNCHER_MARK}.\r\n"
                    'cd /d "%~dp0"\r\n'
-                   f'"{sys.executable}" "{script}" "{name}"\r\n')
+                   f'"{python}" "{script}" .\r\n')
     launcher = project.folder / f"Open {project.path.stem}{ext}"
     try:
+        for old in project.folder.glob("Open *" + ext):      # left behind by a rename
+            if old != launcher and LAUNCHER_MARK in old.read_text(encoding="utf-8", errors="replace"):
+                old.unlink()
         if not launcher.exists() or launcher.read_text(encoding="utf-8") != content:
             atomic_write(launcher, content.encode("utf-8"))
             launcher.chmod(0o755)
@@ -1256,6 +1350,8 @@ class Display:
         framework = getattr(cv2, "currentUIFramework", lambda: "")
         self.qt = str(framework()).upper().startswith("QT")
         self._unzoom = False
+        self.closed = False
+        self._seen_visible = False
         self._create()
 
     def _create(self):
@@ -1289,6 +1385,18 @@ class Display:
             self._unzoom = False
             cv2.destroyWindow(self.title)
             self._create()
+        # Once the window has been seen, it disappearing means its close button was
+        # clicked. (A minimized window still exists; backends that can't tell never
+        # report "visible", so they never trigger this.)
+        try:
+            visible = cv2.getWindowProperty(self.title, cv2.WND_PROP_VISIBLE)
+        except cv2.error:
+            visible = -1
+        if visible >= 1:
+            self._seen_visible = True
+        elif visible < 0 and self._seen_visible:
+            self.closed = True
+            return
         if self.scale != 1.0:
             canvas = cv2.resize(canvas, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
         cv2.imshow(self.title, canvas)
@@ -1601,6 +1709,7 @@ class App:
         self._shift = False
         self._caps = False
         self._audio_len = (None, None)
+        self._draw_failed = False
 
     # -- running
 
@@ -1620,6 +1729,7 @@ class App:
                     print(f"Moved {moved} unused picture(s) into {self.project.folder / TRASH_DIR}")
             except OSError as e:
                 print(f"Couldn't tidy the project folder: {e}")
+            self.project.unlock()
 
     def typed(self, code):
         """key_name() for typing words. Linux (Qt) windows only ever report
@@ -1642,6 +1752,8 @@ class App:
 
     def tick(self, canvas, wait_ms=15):
         self.display.show(canvas)
+        if getattr(self.display, "closed", False):
+            self.running = False
         key = self.display.wait(wait_ms)
         return key, self.display.take_events()
 
@@ -1655,6 +1767,7 @@ class App:
             self.toast(f"Oops: {e}", "error", 6)
 
     def after_modal(self):
+        self.drag = None
         self.camera.flush()
 
     def studio(self):
@@ -1664,7 +1777,20 @@ class App:
                 self.live = frame
             elif not self.camera.ok:
                 self.live = None
-            canvas = self.draw_studio()
+            try:
+                canvas = self.draw_studio()
+                self._draw_failed = False
+            except Exception as e:
+                if not self._draw_failed:
+                    traceback.print_exc()
+                self._draw_failed = True
+                canvas = self.blank()
+                self.hotspots = []
+                put_text(canvas, "Something went wrong showing this movie.", (CANVAS_W // 2, 330), 0.9, WHITE, 2,
+                         UI_BOLD, align="center")
+                put_text(canvas, ascii_text(e)[:90], (CANVAS_W // 2, 380), 0.55, C_DIM, align="center")
+                put_text(canvas, "Press L to open another movie, or Q twice to quit.", (CANVAS_W // 2, 430), 0.7,
+                         C_TEXT, align="center")
             self.last_canvas = canvas
             key, events = self.tick(canvas, 1 if self.camera.ok else 20)
             for event in events:
@@ -1674,11 +1800,14 @@ class App:
             self.safely(self.auto_tick)
 
     def set_project(self, project):
+        if project is not self.project and not project.lock():
+            raise ProjectError("That movie is already open in another window.")
         if self.project is not None and self.project is not project:
             try:
                 self.project.tidy()
             except OSError:
                 pass
+            self.project.unlock()
         self.project = project
         self.renderer = Renderer(project)
         self.cursor = None
@@ -1979,7 +2108,7 @@ class App:
             try:
                 with wave.open(str(path), "rb") as w:
                     self._audio_len = (key, w.getnframes() / w.getframerate())
-            except (OSError, wave.Error, ZeroDivisionError):
+            except Exception:             # empty or damaged file
                 self._audio_len = (key, None)
         return self._audio_len[1]
 
@@ -2046,6 +2175,7 @@ class App:
         first = self.tl_first
         visible = seq[first:first + TILES_FIT]
         dragging = self.drag is not None and self.drag["moved"]
+        drag_pos = self.drag_pos() if dragging else None
         numbers, count = [], 0
         for item in p.items:
             count += item["kind"] == "frame"
@@ -2068,7 +2198,7 @@ class App:
                 if badge:
                     pill(c, badge, x + TILE_W - 2, y + TILE_H - 24, C_ORANGE, C_DARK, 0.38, align="right")
                 border = C_YELLOW if selected else (90, 82, 80)
-                if dragging and pos == self.drag["pos"]:
+                if pos == drag_pos:
                     fill_rect(c, x, y, x + TILE_W, y + TILE_H, C_BG, 0.7)
             cv2.rectangle(c, (x - 2, y - 2), (x + TILE_W + 1, y + TILE_H + 1), border, 3 if selected else 1)
             put_text(c, label, (x + TILE_W // 2, y + TILE_H + 18), 0.45, C_TEXT if selected else C_DIM, 1,
@@ -2121,6 +2251,19 @@ class App:
             self.draw_button(c, (x0, EDIT_Y, int(x0 + width), EDIT_Y + 32), label, action=("cmd", cmd),
                              scale=0.45, align="center", dim=busy)
 
+    def tile_id(self, pos):
+        kind, i = self.sequence()[pos]
+        return "cam" if kind == "cam" else self.project.items[i]["id"]
+
+    def drag_pos(self):
+        """Where the tile being dragged is now (things may have moved since)."""
+        if self.drag is None:
+            return None
+        for pos in range(len(self.sequence())):
+            if self.tile_id(pos) == self.drag["tile"]:
+                return pos
+        return None
+
     def drop_boundary(self, x):
         b = int(round((x - TILES_X0 + TILE_GAP / 2) / TILE_STEP))
         return clamp(self.tl_first + b, 0, len(self.sequence()))
@@ -2138,12 +2281,13 @@ class App:
     def on_mouse(self, event):
         kind, x, y = event[0], event[1], event[2]
         if kind == "down":
+            self.drag = None              # in case a button-up got lost
             action = self.hit(x, y)
             if action is None:
                 return
             if action[0] == "tile":
                 self.set_cursor_pos(action[1])
-                self.drag = {"pos": action[1], "x0": x, "x": x, "moved": False}
+                self.drag = {"tile": self.tile_id(action[1]), "x0": x, "x": x, "moved": False}
             elif action[0] == "cmd":
                 self.run_command(action[1])
             elif action[0] == "trans":
@@ -2155,10 +2299,11 @@ class App:
             if abs(x - self.drag["x0"]) > 12:
                 self.drag["moved"] = True
         elif kind == "up" and self.drag is not None:
-            drag, self.drag = self.drag, None
-            if drag["moved"] and drag["pos"] < len(self.sequence()):
+            pos = self.drag_pos()
+            moved, self.drag = self.drag["moved"], None
+            if moved and pos is not None:
                 b = self.drop_boundary(x)
-                self.move_tile(drag["pos"], b if b <= drag["pos"] else b - 1)
+                self.move_tile(pos, b if b <= pos else b - 1)
         elif kind == "wheel":
             self.tl_first -= event[3]
 
@@ -2169,7 +2314,7 @@ class App:
         if not self.auto:
             return
         now = time.monotonic()
-        if self.cursor is not None or self.live is None:
+        if self.cursor is not None or self.live is None or self.drag is not None:
             self.next_auto = now + AUTO_CAPTURE_SECONDS       # paused while looking at a picture
         elif now >= self.next_auto:
             self.cmd_snap()
@@ -2440,7 +2585,8 @@ class App:
             return None
         try:
             return read_wav(path)
-        except (OSError, ValueError, wave.Error) as e:
+        except Exception as e:            # empty or damaged file
+            print(f"Couldn't read {path}: {e!r}")
             self.toast(f"Couldn't read the voice track: {e}", "error")
             return None
 
@@ -2927,19 +3073,19 @@ class App:
                 return False
             try:
                 project = Project.create(name or default, self.projects_dir)
-            except OSError as e:
+                self.set_project(project)
+            except (ProjectError, OSError) as e:
                 self.toast(f"Couldn't make the movie folder: {e}", "error", 6)
                 return False
-            self.set_project(project)
             self.toast("New movie! Press SPACE to take your first picture.", "good", 4)
             return True
         if entry["kind"] == "legacy":
             try:
                 project = Project.import_legacy(entry["path"], self.projects_dir)
+                self.set_project(project)
             except (ProjectError, OSError) as e:
                 self.toast(f"Couldn't bring in that old save: {e}", "error", 6)
                 return False
-            self.set_project(project)
             self.toast(f"Brought in your old save as '{project.name}'.", "good", 5)
             return True
         if self.project is not None:
@@ -2950,11 +3096,10 @@ class App:
 
     def open_path(self, path):
         try:
-            project = Project.open(path, self.projects_dir)
+            self.set_project(Project.open(path, self.projects_dir))
         except (ProjectError, OSError) as e:
             self.toast(f"Couldn't open that: {e}", "error", 6)
             return False
-        self.set_project(project)
         return True
 
     def browse(self):

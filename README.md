@@ -109,7 +109,12 @@ Stop Motion Projects/
   file is copied into `backups/` (the last 30 are kept).
 - **Repairs itself:** if the project file is ever damaged, the newest good backup is used and
   any pictures taken after it are put back. If it's missing altogether, it's rebuilt from the
-  pictures. The damaged file is kept to one side, not deleted.
+  pictures. The damaged file is kept to one side, not deleted. A picture file that has gone
+  missing shows as a grey card rather than being dropped, in case it turns up again.
+- **Go back to a backup** by opening a file from `backups/`. That becomes an ordinary change,
+  so `Z` undoes it.
+- **One window per movie:** if a movie is already open (say it got double-clicked twice), a
+  second window won't open it too, so they can't write over each other's pictures.
 - **Rename a movie** by renaming its `.stopmo` file.
 - **Old saves** (`stopmotion_project_*` folders from the earlier version) show up in the list
   of movies marked OLD SAVE. Opening one copies it into a new project.
@@ -120,7 +125,8 @@ Stop Motion Projects/
   **Open a file...** to use your computer's own Open window and find a `.stopmo` anywhere.
 - **Double-click** the `Open <movie>.command` file in the movie's folder (`.bat` on Windows,
   `.sh` on Linux). It remembers where Python and the studio live, so if you move this repository
-  folder, open the movie once from the studio and the file will be updated.
+  folder, open the movie once from the studio and the file will be updated. Opening any file in
+  a movie's folder (a picture, say) opens that movie.
 - **Double-click the `.stopmo` file itself (macOS):** run this once:
 
   ```bash

@@ -82,6 +82,110 @@ class ProjectFileTests(TempDirTest):
         p.path.rename(renamed)
         self.assertEqual(sm.Project.open(renamed).name, "Dragon")
 
+    def test_opening_a_backup_goes_back_to_it_and_can_be_undone(self):
+        p = sm.Project.create("Movie", self.tmp)
+        with p.change():
+            p.add_frame(solid(RED), 0)
+        p.save(backup=True)
+        with p.change():
+            p.add_frame(solid(BLUE), 1)
+        p.save(backup=True)                    # backups: [1 picture], [2 pictures]
+        backups = list((p.folder / "backups").glob("*.stopmo"))
+        self.assertEqual(len(backups), 3)           # empty, 1 picture, 2 pictures (same second, all kept)
+        oldest = next(f for f in backups if len(sm.Project.load_doc(f)["items"]) == 1)
+        restored = sm.Project.open(oldest)
+        self.assertTrue(any("Went back to the backup from 20" in note for note in restored.notes))
+        self.assertEqual(restored.path, p.path)
+        self.assertEqual(len(restored.items), 1)
+        self.assertEqual(len(sm.Project.load_doc(oldest)["items"]), 1)       # the backup itself untouched
+        self.assertFalse((p.folder / "backups" / "frames").exists())
+        restored.undo()
+        self.assertEqual(len(sm.Project.open(p.path).items), 2)
+
+    def test_missing_pictures_are_kept_not_dropped(self):
+        p = sm.Project.create("Movie", self.tmp)
+        with p.change():
+            p.add_frame(solid(RED), 0)
+            p.add_frame(solid(BLUE), 1)
+        moved_away = self.tmp / "elsewhere.jpg"
+        shutil.move(str(p.file_path(p.items[0]["file"])), str(moved_away))
+        again = sm.Project.open(p.path)
+        self.assertEqual(len(again.items), 2)
+        self.assertTrue(any("can't be found" in note for note in again.notes))
+        self.assertEqual(len(sm.Project.load_doc(p.path)["items"]), 2)
+        self.assertEqual(sm.Renderer(again).image(again.items[0]).shape, (180, 320, 3))  # a grey card
+        shutil.move(str(moved_away), str(p.file_path(p.items[0]["file"])))
+        self.assertEqual(len(sm.Project.open(p.path).items), 2)                # and it's back
+
+    def test_a_missing_file_name_opens_the_project_that_is_there(self):
+        p = sm.Project.create("Movie", self.tmp)
+        with p.change():
+            p.add_frame(solid(RED), 0)
+        p.path.rename(p.path.with_name("Dragon.stopmo"))
+        again = sm.Project.open(p.path)            # the old name
+        self.assertEqual(again.name, "Dragon")
+        self.assertEqual(len(again.items), 1)
+        self.assertEqual(sorted(f.name for f in p.folder.glob("*.stopmo")), ["Dragon.stopmo"])
+
+    def test_tidy_keeps_pictures_another_project_file_uses(self):
+        p = sm.Project.create("Movie", self.tmp)
+        with p.change():
+            p.add_frame(solid(RED), 0)
+        shutil.copy2(p.path, p.folder / "Copy.stopmo")
+        with p.change():
+            p.items.clear()
+        self.assertEqual(p.tidy(), 0)
+
+    def test_a_failed_backup_doesnt_stop_saving(self):
+        p = sm.Project.create("Movie", self.tmp)
+        with mock.patch.object(p, "_backup", side_effect=PermissionError("locked")), mock.patch("builtins.print"):
+            with p.change():
+                p.add_frame(solid(RED), 0)
+        self.assertEqual(len(sm.Project.load_doc(p.path)["items"]), 1)
+
+    def test_picture_files_are_never_overwritten(self):
+        p = sm.Project.create("Movie", self.tmp)
+        with p.change():
+            first = p.add_frame(solid(RED), 0)
+        p.doc["next_frame"] = 1                    # e.g. another window got there first
+        with p.change():
+            second = p.add_frame(solid(BLUE), 1)
+        self.assertNotEqual(first["file"], second["file"])
+        self.assertGreater(cv2.imread(str(p.file_path(first["file"])))[0, 0, 2], 200)
+
+    def test_one_window_per_movie(self):
+        p = sm.Project.create("Movie", self.tmp)
+        a, b = sm.Project.open(p.path), sm.Project.open(p.path)
+        self.assertTrue(a.lock())
+        self.assertFalse(b.lock())
+        a.unlock()
+        self.assertTrue(b.lock())
+        b.unlock()
+
+    def test_trash_forgets_the_oldest_deleted_first(self):
+        p = sm.Project.create("Movie", self.tmp)
+        with p.change():
+            p.add_frame(solid(RED), 0)
+        old = time.time() - 10 * 24 * 3600
+        os.utime(p.file_path(p.items[0]["file"]), (old, old))
+        with p.change():
+            p.items.clear()
+        p.tidy()
+        trashed = next((p.folder / "trash").iterdir())
+        self.assertGreater(trashed.stat().st_mtime, time.time() - 60)
+
+    def test_an_empty_voice_file_doesnt_crash(self):
+        p = sm.Project.create("Movie", self.tmp)
+        (p.folder / "audio").mkdir()
+        (p.folder / "audio" / "voice.wav").write_bytes(b"")
+        with p.change():
+            p.doc["audio"] = {"file": "audio/voice.wav"}
+        app, display = make_app(self.tmp, ["p", None, "x", None])
+        with mock.patch("builtins.print"), mock.patch.object(sm, "sound_module", return_value=object()):
+            run(app, p.path)
+        self.assertIsNotNone(display.last)
+        self.assertIsNone(app.audio_seconds())
+
     def test_open_rejects_other_files(self):
         other = self.tmp / "notes.txt"
         other.write_text("hi")
@@ -133,13 +237,12 @@ class ProjectFileTests(TempDirTest):
         legacy.mkdir()
         for n, color in enumerate((RED, GREEN), start=1):
             cv2.imwrite(str(legacy / f"frame_{n:05d}.png"), solid(color))
-        p = sm.Project.open(legacy)           # opening an old save imports it (in PROJECTS_DIR)...
-        self.addCleanup(shutil.rmtree, p.folder, ignore_errors=True)
+        projects = self.tmp / "projects"
+        p = sm.Project.open(legacy, projects)       # opening an old save imports it
+        self.assertEqual(p.folder.parent, projects)
         self.assertEqual(len(p.items), 2)
         self.assertEqual(p.doc["imported_from"], str(legacy))
-        p2 = sm.Project.import_legacy(legacy, self.tmp)       # ...or wherever you ask
-        self.assertEqual(p2.folder.parent, self.tmp)
-        self.assertTrue(p2.name.startswith("Old save 2026-05-01"))
+        self.assertTrue(p.name.startswith("Old save 2026-05-01"))
 
     def test_undo_and_redo(self):
         p = sm.Project.create("Movie", self.tmp)
@@ -192,14 +295,15 @@ class ProjectFileTests(TempDirTest):
         p.path.write_text(json.dumps(doc))
         again = sm.Project.open(p.path)
         self.assertEqual(again.fps, sm.FPS)
-        self.assertEqual([it["kind"] for it in again.items], ["frame", "title", "frame"])
-        self.assertEqual(again.items[1]["lines"], ["Hi"])
-        self.assertGreater(again.items[1]["hold"], 0)
-        self.assertIsNone(again.items[1]["transition"])
+        # The missing picture is kept (it may turn up again); junk is dropped.
+        self.assertEqual([it["kind"] for it in again.items], ["frame", "frame", "title", "frame"])
+        self.assertEqual(again.items[2]["lines"], ["Hi"])
+        self.assertGreater(again.items[2]["hold"], 0)
+        self.assertIsNone(again.items[2]["transition"])
         self.assertEqual(again.items[0]["transition"]["type"], "fade")
-        self.assertNotEqual(again.items[0]["id"], again.items[2]["id"])
+        self.assertNotEqual(again.items[0]["id"], again.items[3]["id"])
         self.assertGreater(again.doc["next_frame"], 1)      # never overwrite a picture
-        self.assertTrue(any("missing" in note for note in again.notes))
+        self.assertTrue(any("can't be found" in note for note in again.notes))
 
     def test_list_projects(self):
         a = sm.Project.create("A", self.tmp)
@@ -220,13 +324,17 @@ class ProjectFileTests(TempDirTest):
 
     @unittest.skipIf(os.name == "nt", "shell launcher")
     def test_launcher(self):
-        p = sm.Project.create("It's a Movie!", self.tmp)
+        p = sm.Project.create("-It's a Movie!", self.tmp)
         launcher = sm.write_launcher(p)
         self.assertTrue(os.access(launcher, os.X_OK))
         self.assertIn("It's a Movie!", launcher.name)
         subprocess.run(["sh", "-n", str(launcher)], check=True)
-        text = launcher.read_text()
-        self.assertIn("It'\"'\"'s a Movie!.stopmo", text)       # safely quoted for the shell
+        self.assertTrue(launcher.read_text().endswith(" .\n"))   # opens its folder, whatever the file is called
+        # After a rename there's one launcher, with the new name.
+        p.path.rename(p.path.with_name("Dragon.stopmo"))
+        renamed = sm.Project.open(p.folder)
+        new_launcher = sm.write_launcher(renamed)
+        self.assertEqual([f.name for f in p.folder.glob("Open *")], [new_launcher.name])
 
 
 # -------------------------------------------------------------------- movie
@@ -326,6 +434,20 @@ class MovieTests(TempDirTest):
         cap = cv2.VideoCapture(str(out))
         self.assertEqual(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), len(sm.build_plan(p)))
         cap.release()
+
+    def test_export_cleans_up_after_errors(self):
+        p = self.make()
+        out = self.tmp / "movie.mp4"
+
+        def boom(done, total):
+            if done > 2:
+                raise RuntimeError("disk full")
+            return True
+
+        for ffmpeg in (True, False):
+            with mock.patch.object(sm, "has_ffmpeg", return_value=ffmpeg), self.assertRaises(RuntimeError):
+                sm.export_movie(p, out, boom)
+            self.assertEqual(list(self.tmp.glob("*.mp4")), [])
 
     def test_export_can_be_cancelled(self):
         p = self.make()
@@ -460,6 +582,32 @@ class StudioTests(TempDirTest):
         self.assertGreater(first[0, 0, 0], 200)               # blue is first now
         self.assertEqual(app.cursor, 1)
 
+    def test_dragging_the_camera_while_auto_snap_fires(self):
+        cam = FakeCamera(RED)
+        x = [sm.TILES_X0 + k * sm.TILE_STEP + sm.TILE_W // 2 for k in range(5)]
+        y = sm.TILE_Y + sm.TILE_H // 2
+
+        def auto_snap_now():
+            self.app.cmd_snap()                # a picture arrives mid-drag
+
+        script = ["space", "space", None,
+                  lambda: self.display.events.extend([("down", x[2], y), ("drag", x[1], y)]), None,
+                  auto_snap_now, None,
+                  lambda: self.display.events.append(("up", x[0] - sm.TILE_W // 2 - 5, y)), None]
+        app, _ = self.open_app(script, cam)
+        self.assertEqual(app.insert_at, 0)                     # the camera went to the start
+        self.assertEqual(len(app.project.items), 3)
+
+    def test_lost_button_release_doesnt_move_things_later(self):
+        x0 = sm.TILES_X0 + sm.TILE_W // 2
+        y = sm.TILE_Y + sm.TILE_H // 2
+        script = ["space", "space", None,
+                  lambda: self.display.events.extend([("down", x0, y), ("drag", x0 + 200, y)]), None,
+                  ("click", sm.PANEL_X + 100, sm.VIEW_Y + 400), None]      # the release never came
+        app, _ = self.open_app(script)
+        self.assertIsNone(app.drag)
+        self.assertEqual(app.insert_at, 2)
+
     def test_title_card(self):
         script = ["space", None, "c"] + list("Hi Mom") + ["tab", "b", "y", " ", "S", "a", "m", "backspace",
                                                         "right", "enter", None]
@@ -522,6 +670,35 @@ class StudioTests(TempDirTest):
         self.assertEqual([it["kind"] for it in app.project.items], ["title"])
 
 
+class WindowTests(unittest.TestCase):
+    def test_close_button_quits_but_minimizing_doesnt(self):
+        states = iter([1.0, 1.0, 0.0, 1.0, cv2.error("gone")])
+
+        def visible(*args):
+            state = next(states)
+            if isinstance(state, Exception):
+                raise state
+            return state
+
+        with mock.patch.object(cv2, "namedWindow"), mock.patch.object(cv2, "setMouseCallback"), \
+                mock.patch.object(cv2, "imshow") as imshow, mock.patch.object(cv2, "getWindowProperty", visible):
+            display = sm.Display()
+            for _ in range(4):
+                display.show(np.zeros((4, 4, 3), np.uint8))
+            self.assertFalse(display.closed)                   # 0 = minimized, not closed
+            display.show(np.zeros((4, 4, 3), np.uint8))
+            self.assertTrue(display.closed)
+            self.assertEqual(imshow.call_count, 4)
+
+    def test_backends_that_cant_tell_never_close(self):
+        with mock.patch.object(cv2, "namedWindow"), mock.patch.object(cv2, "setMouseCallback"), \
+                mock.patch.object(cv2, "imshow"), mock.patch.object(cv2, "getWindowProperty", return_value=-1.0):
+            display = sm.Display()
+            for _ in range(5):
+                display.show(np.zeros((4, 4, 3), np.uint8))
+            self.assertFalse(display.closed)
+
+
 class PickerTests(TempDirTest):
     def test_new_movie_then_reopen(self):
         with mock.patch("builtins.print"):
@@ -534,6 +711,17 @@ class PickerTests(TempDirTest):
             run(app2)
         self.assertEqual(app2.project.path, app.project.path)
         self.assertEqual(len(app2.project.items), 1)
+
+    def test_a_movie_open_in_another_window_isnt_opened_twice(self):
+        p = sm.Project.create("Movie", self.tmp)
+        other = sm.Project.open(p.path)
+        self.assertTrue(other.lock())
+        self.addCleanup(other.unlock)
+        app, _ = make_app(self.tmp, ["esc"])
+        with mock.patch("builtins.print"):
+            run(app, p.path)
+        self.assertIsNone(app.project)
+        self.assertIn("already open", app.toast_text)
 
     def test_escape_at_start_quits(self):
         app, _ = make_app(self.tmp, ["esc"])

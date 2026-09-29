@@ -10,6 +10,7 @@ trash/
 Open *.command
 Open *.sh
 Open *.bat
+.in-use
 stop_motion_export*.mp4
 stopmotion_*.mp4
 *.mp4

@@ -135,3 +135,5 @@ def run(app, open_path=None):
         app.run(open_path)
     except ScriptDone:
         pass
+    finally:
+        app.shutdown()
