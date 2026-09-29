@@ -1240,11 +1240,25 @@ class Display:
         self.title = title
         self.scale = scale
         self.events = []
-        cv2.namedWindow(title, cv2.WINDOW_AUTOSIZE)
-        cv2.setMouseCallback(title, self._mouse)
+        # Linux (Qt) windows zoom the picture when you scroll, and there's no
+        # way to switch that off - so after a scroll we make a fresh window.
+        framework = getattr(cv2, "currentUIFramework", lambda: "")
+        self.qt = str(framework()).upper().startswith("QT")
+        self._unzoom = False
+        self._create()
+
+    def _create(self):
+        # GUI_NORMAL hides the zoom toolbar that Qt windows add.
+        cv2.namedWindow(self.title, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
+        cv2.setMouseCallback(self.title, self._mouse)
 
     def _mouse(self, event, x, y, flags, param):
-        x, y = int(x / self.scale), int(y / self.scale)
+        try:
+            self._record_mouse(event, int(x / self.scale), int(y / self.scale), flags)
+        except Exception as e:           # never let a stray event upset the window
+            print(f"Mouse event ignored: {e}")
+
+    def _record_mouse(self, event, x, y, flags):
         if event == cv2.EVENT_LBUTTONDOWN:
             self.events.append(("down", x, y))
         elif event == cv2.EVENT_LBUTTONUP:
@@ -1255,9 +1269,15 @@ class Display:
             else:
                 self.events.append(("drag", x, y))
         elif event in (cv2.EVENT_MOUSEWHEEL, cv2.EVENT_MOUSEHWHEEL):
-            self.events.append(("wheel", x, y, 1 if cv2.getMouseWheelDelta(flags) > 0 else -1))
+            # The wheel amount lives in the top bits of flags (getMouseWheelDelta in C++).
+            self.events.append(("wheel", x, y, 1 if (flags >> 16) > 0 else -1))
+            self._unzoom = self.qt
 
     def show(self, canvas):
+        if self._unzoom:
+            self._unzoom = False
+            cv2.destroyWindow(self.title)
+            self._create()
         if self.scale != 1.0:
             canvas = cv2.resize(canvas, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
         cv2.imshow(self.title, canvas)
@@ -1300,6 +1320,10 @@ def key_name(code):
     if 32 < low < 127:
         return chr(low)
     return None
+
+
+SHIFT_KEYS = (65505, 65506)
+CAPS_LOCK_KEY = 65509
 
 
 KEY_COMMANDS = {
@@ -1563,6 +1587,8 @@ class App:
         self.speaker = Speaker()
         self.recorder_factory = MicRecorder
         self.countdown_seconds = 3
+        self._shift = False
+        self._caps = False
 
     # -- running
 
@@ -1586,6 +1612,25 @@ class App:
                     print(f"Moved {moved} unused picture(s) into {self.project.folder / TRASH_DIR}")
             except OSError as e:
                 print(f"Couldn't tidy the project folder: {e}")
+
+    def typed(self, code):
+        """key_name() for typing words. Linux (Qt) windows only ever report
+        lowercase letters, but send Shift and Caps Lock as keys of their own,
+        so keep track of those here. (Macs and Windows send capitals directly
+        and never send these, so this changes nothing there.)"""
+        low = code & 0xFFFF if code is not None and code >= 0 else None
+        if low in SHIFT_KEYS:
+            self._shift = True
+            return None
+        if low == CAPS_LOCK_KEY:
+            self._caps = not self._caps
+            return None
+        name = key_name(code)
+        if name is not None:
+            if len(name) == 1 and name.islower() and self._shift != self._caps:
+                name = name.upper()
+            self._shift = False
+        return name
 
     def tick(self, canvas, wait_ms=15):
         self.display.show(canvas)
@@ -2049,8 +2094,7 @@ class App:
             cv2.circle(c, (x + 12, y + 12), 5, C_RED, -1, cv2.LINE_AA)
 
     def draw_transition_pill(self, c, cx, tr, action):
-        rect = pill(c, TRANSITION_NAMES[tr["type"]], cx, TILE_Y + TILE_H // 2 - 13, C_PURPLE, WHITE, 0.4,
-                    align="center")
+        rect = pill(c, TRANSITION_NAMES[tr["type"]], cx, TILE_Y + 4, C_PURPLE, WHITE, 0.4, align="center")
         self.hotspots.append((rect, action))
 
     EDIT_BUTTONS = [("< Prev", "prev"), ("Next >", "next"), ("Delete X", "delete"), ("Copy D", "duplicate"),
@@ -2524,7 +2568,7 @@ class App:
             view = fit_image(render_title({"lines": shown, "style": style}, p.size), (VIEW_W, VIEW_H))
             key, events = self.tick(self.draw_title_editor(view, style, item is None), 30)
             action = self.clicked(events)
-            name = key_name(key)
+            name = self.typed(key)
             if action is not None and action[0] == "style":
                 style = action[1]
             elif action == ("cmd", "done") or name == "enter":
@@ -2630,7 +2674,7 @@ class App:
                              align="center")
             key, events = self.tick(c, 30)
             action = self.clicked(events)
-            name = key_name(key)
+            name = self.typed(key)
             if action == ("ok",) or name == "enter":
                 return text.strip()
             if action == ("cancel",) or name == "esc":

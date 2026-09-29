@@ -457,6 +457,15 @@ class StudioTests(TempDirTest):
         self.assertEqual(title["hold"], round(sm.TITLE_SECONDS * sm.FPS))
         self.assertEqual(app.insert_at, 2)                    # the camera moved past the title
 
+    def test_capitals_on_linux_windows(self):
+        # OpenCV's Qt windows send Shift / Caps Lock as keys and letters in lowercase.
+        shift, caps = 65505, 65509
+        script = ["c", shift, "h", "i", " ", caps, "m", "o", "m", caps, "!", "enter", None,
+                  "n", "5", "enter", None]
+        app, _ = self.open_app(script)
+        self.assertEqual(app.project.items[0]["lines"], ["Hi MOM!"])
+        self.assertEqual(app.project.doc["frame_goal"], 5)
+
     def test_record_voice_and_play_it(self):
         with mock.patch.object(sm, "sound_problem", return_value=None), \
                 mock.patch.object(sm, "sound_module", return_value=object()):
