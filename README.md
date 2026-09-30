@@ -240,7 +240,8 @@ Near the top of `stopmotion.py`:
 - `PROJECTS_DIR`: where new movies go (or run with `--projects-dir some/folder`).
 - `ONION_OPACITY`, `AUTO_CAPTURE_SECONDS`, `TITLE_SECONDS`, `TRANSITION_SECONDS`,
   `SHUTTER_SOUND`.
-- `WINDOW_SCALE = 1.0`: the window is 1280 x 776. Try `0.8` on a small screen.
+- `WINDOW_SCALE = 1.0`: the window is 1280 x 776. Try `0.8` on a small screen (or run
+  `python3 stopmotion.py --scale 0.8`).
 
 ## Camera and microphone permissions
 

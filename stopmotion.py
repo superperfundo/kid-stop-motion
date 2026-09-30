@@ -2220,7 +2220,7 @@ HELP_LINES = [
     ("V", "Speed: pictures per second"),
     ("E", "Make an MP4 movie"),
     ("L", "Projects: open another movie, or a new one"),
-    ("K", "Camera: switch, flip, lock focus / exposure / colour"),
+    ("K", "Camera: switch, flip, lock focus and colour"),
     ("< >  (or , .)", "Pick a picture. The camera is a tile too!"),
     ("X", "Delete the picked picture"),
     ("D", "Copy the picked picture"),
@@ -4046,6 +4046,8 @@ def main(argv=None):
     parser.add_argument("project", nargs="?", help="a .stopmo project file (or a project folder) to open")
     parser.add_argument("--camera", type=int, default=CAMERA_INDEX, help="which webcam to use: 0, 1, ...")
     parser.add_argument("--projects-dir", default=str(PROJECTS_DIR), help="where new movies are saved")
+    parser.add_argument("--scale", type=float, default=WINDOW_SCALE,
+                        help="window size, e.g. 0.8 if the window doesn't fit your screen")
     parser.add_argument("--export", metavar="PROJECT", help="make an MP4 from a project and exit (no camera needed)")
     parser.add_argument("--install-mac-app", action="store_true",
                         help="macOS: make .stopmo files open with a double-click")
@@ -4072,7 +4074,7 @@ def main(argv=None):
         print("On macOS, you may need to allow Terminal (or your Python app) to use the camera:")
         print("System Settings -> Privacy & Security -> Camera\n")
 
-    display = Display()
+    display = Display(scale=clamp(args.scale, 0.3, 3.0))
     app = App(display, camera, projects_dir=args.projects_dir)
     try:
         app.run(args.project)

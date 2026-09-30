@@ -850,6 +850,16 @@ class WindowTests(unittest.TestCase):
             self.assertTrue(display.closed)
             self.assertEqual(imshow.call_count, 4)
 
+    def test_a_scaled_window_still_clicks_in_the_right_place(self):
+        with mock.patch.object(cv2, "namedWindow"), mock.patch.object(cv2, "setMouseCallback"), \
+                mock.patch.object(cv2, "imshow") as imshow, mock.patch.object(cv2, "getWindowProperty",
+                                                                             return_value=1.0):
+            display = sm.Display(scale=0.5)
+            display.show(np.zeros((sm.CANVAS_H, sm.CANVAS_W, 3), np.uint8))
+            self.assertEqual(imshow.call_args[0][1].shape[:2], (sm.CANVAS_H // 2, sm.CANVAS_W // 2))
+            display._mouse(cv2.EVENT_LBUTTONDOWN, 100, 50, 0, None)
+            self.assertEqual(display.take_events(), [("down", 200, 100)])
+
     def test_backends_that_cant_tell_never_close(self):
         with mock.patch.object(cv2, "namedWindow"), mock.patch.object(cv2, "setMouseCallback"), \
                 mock.patch.object(cv2, "imshow"), mock.patch.object(cv2, "getWindowProperty", return_value=-1.0):
