@@ -276,7 +276,7 @@ class Project:
     flat battery never loses more than the picture being taken.
     """
 
-    EDIT_KEYS = ("items", "end_transition", "audio", "fps")
+    EDIT_KEYS = ("items", "end_transition", "audio", "fps", "size")
 
     def __init__(self, path, doc):
         self.path = Path(path)
@@ -336,8 +336,11 @@ class Project:
         return project
 
     @classmethod
-    def open(cls, path, projects_dir=None):
-        """Open a .stopmo file - or a project folder, or any file inside one."""
+    def open(cls, path, projects_dir=None, lock=False):
+        """Open a .stopmo file - or a project folder, or any file inside one.
+
+        With lock=True the project is locked (see lock()) before anything is
+        written, and ProjectError is raised if another window has it open."""
         path = Path(path).expanduser().absolute()
         if path.is_file() and path.suffix.lower() != PROJECT_EXT:
             for folder in (path.parent, path.parent.parent):
@@ -345,7 +348,7 @@ class Project:
                     path = folder
                     break
         if path.parent.name == BACKUPS_DIR and (path.parent.parent / FRAMES_DIR).is_dir():
-            return cls._restore_backup(path)
+            return cls._restore_backup(path, lock)
         if path.suffix.lower() == PROJECT_EXT and not path.exists() and path.parent.is_dir():
             path = path.parent          # e.g. it was renamed: open the project file that's there now
         if path.is_dir():
@@ -353,7 +356,10 @@ class Project:
             if found:
                 path = found[0]
             elif list(path.glob("frame_*.png")):
-                return cls.import_legacy(path, projects_dir)
+                project = cls.import_legacy(path, projects_dir)
+                if lock:
+                    project.lock()        # a brand new folder: nobody else can have it
+                return project
             elif (path / FRAMES_DIR).is_dir():
                 path = path / (path.name + PROJECT_EXT)
             else:
@@ -363,8 +369,11 @@ class Project:
         elif not path.exists() and not (path.parent / FRAMES_DIR).is_dir():
             raise ProjectError(f"Can't find {path}")
 
+        project = cls(path, None)
+        if lock and not project.lock():
+            raise ProjectError("That movie is already open in another window.")
         doc, source = cls._read_newest_good(path)
-        project = cls(path, doc or new_document(path.stem))
+        project.doc = doc or new_document(path.stem)
         changed = False
         if source != path and path.exists():
             # Keep the damaged file for the grown-ups, then carry on.
@@ -383,13 +392,13 @@ class Project:
         return project
 
     @classmethod
-    def _restore_backup(cls, backup):
+    def _restore_backup(cls, backup, lock=False):
         """Opening a file from backups/ goes back to it - as an ordinary change,
         so Z (undo) returns to how things were."""
         doc = cls.load_doc(backup)
         if doc is None:
             raise ProjectError(f"{backup.name} is damaged")
-        project = cls.open(backup.parent.parent)
+        project = cls.open(backup.parent.parent, lock=lock)
         with project.change():
             project.doc.update({k: doc.get(k, project.doc.get(k)) for k in cls.EDIT_KEYS})
             project._repair()
@@ -1571,7 +1580,7 @@ class CameraControls:
                 return
             try:
                 info = mac_camera_info(index)
-            except (OSError, ValueError):
+            except (OSError, ValueError, AttributeError):   # AttributeError: a camera with no name
                 info = None
             if info is None:
                 return
@@ -1647,11 +1656,13 @@ class CameraControls:
             return f"Couldn't change {name}: {err}"
 
     def set_value(self, name, value):
-        """Lock a setting at a particular value."""
+        """Lock a setting at a particular value. Returns what went wrong, or None."""
         try:
             self.settings[name].lock(value)
         except OSError as err:
             print(f"Couldn't set {name}: {err}")
+            return f"Couldn't set {name}: {err}"
+        return None
 
     def refresh(self):
         """Pick up the values the camera's auto modes have chosen."""
@@ -1772,7 +1783,7 @@ class ExposureMatch(PictureMatch):
         return math.log(max(float(linear_light(frame).mean()), 1e-6))
 
     def to_x(self, value):
-        return math.log(value)
+        return math.log(max(value, 1))           # some cameras' exposure range starts at 0
 
     def from_x(self, x):
         return math.exp(x)
@@ -1839,6 +1850,7 @@ class CameraSetup:
         self.settings_file = Path(settings_file)
         self.controls = None
         self.generation = None
+        self.index = None
         self.matches = {}         # exposure / white balance locks still settling: name -> PictureMatch
         self.brightness = 0       # our own brightening, in EXPOSURE_STEPs, for cameras we can't control
         self._lut = None
@@ -1858,11 +1870,23 @@ class CameraSetup:
         switched, or come back after dropping out)."""
         if camera.generation == self.generation:
             return
+        # The same camera coming back after dropping out keeps its locked settings.
+        same = self.controls is not None and camera.index == self.index
+        name, brightness = self.name, self.brightness
+        kept = {key: setting.value for key, setting in self.settings.items() if setting.locked} if same else {}
         self.close()
-        self.generation = camera.generation
-        if camera.ok:
-            self.controls = self.make_controls(camera.index)
-            print(f"Camera {camera.index + 1}: {self.controls.name} ({self.controls.summary()})")
+        self.generation, self.index = camera.generation, camera.index
+        if not camera.ok:
+            return
+        self.controls = self.make_controls(camera.index)
+        print(f"Camera {camera.index + 1}: {self.controls.name} ({self.controls.summary()})")
+        if same and self.controls.name == name and (kept or brightness):
+            for key, value in kept.items():
+                if key in self.settings:
+                    self.controls.set_value(key, value)
+            if brightness:
+                self.brightness, self._lut = brightness, exposure_lut(brightness * EXPOSURE_STEP)
+            self.say("The camera is back, with its settings locked as before.")
 
     def close(self):
         """Put the camera back on auto, so other apps don't find it locked."""
@@ -1892,10 +1916,13 @@ class CameraSetup:
             print(f"Couldn't remember that: {e}")
         return self.flipped()
 
-    def process(self, frame):
-        """The camera's picture as the studio should show and capture it."""
+    def process(self, frame, size=None):
+        """The camera's picture as the studio should show and capture it,
+        cropped to `size` (the movie's) if given."""
         if self.flipped():
             frame = cv2.flip(frame, -1)
+        if size is not None:
+            frame = fill_image(frame, size)
         self.camera_frame = frame
         for name, match in list(self.matches.items()):
             if match.update(frame):
@@ -1939,8 +1966,8 @@ class CameraSetup:
         focus = self.settings.get("focus")
         if focus is None:
             return f"{self.name} can't set focus."
-        self.controls.set_value("focus", focus.value + direction * focus.step)
-        return f"Focus LOCKED at {self.controls.describe('focus')}"
+        problem = self.controls.set_value("focus", focus.value + direction * focus.step)
+        return problem or f"Focus LOCKED at {self.controls.describe('focus')}"
 
     def brighter(self, step):
         """- / +: a third of a stop darker or brighter, and locked there."""
@@ -1954,8 +1981,8 @@ class CameraSetup:
             self.matches["exposure"].target += step * EXPOSURE_STEP * math.log(2)
             return "Locking exposure..."
         if exposure.locked:
-            self.controls.set_value("exposure", exposure.value * 2 ** (step * EXPOSURE_STEP))
-            return f"Exposure LOCKED at {exposure.format(exposure.value)}"
+            problem = self.controls.set_value("exposure", exposure.value * 2 ** (step * EXPOSURE_STEP))
+            return problem or f"Exposure LOCKED at {exposure.format(exposure.value)}"
         if self.camera_frame is None:
             return "The camera isn't ready yet."
         # On auto: lock a step brighter or darker than auto has it.
@@ -1966,9 +1993,10 @@ class CameraSetup:
     def set_slider(self, name, fraction):
         """A slider moved: lock that setting at the slider's value."""
         setting = self.settings.get(name)
-        if setting is not None:
-            self.matches.pop(name, None)
-            self.controls.set_value(name, setting.from_slider(clamp(fraction, 0.0, 1.0) * 100))
+        if setting is None:
+            return None
+        self.matches.pop(name, None)
+        return self.controls.set_value(name, setting.from_slider(clamp(fraction, 0.0, 1.0) * 100))
 
     def status(self, name):
         """(words, state) for a setting; state is "n/a", "auto", "locking" or "locked"."""
@@ -2000,6 +2028,8 @@ class Camera:
         self._retry_at = 0.0
         self._opener = None
         self._opened = None
+        self._attempt = 0           # a reconnect that finishes after a switch is thrown away
+        self._guard = threading.Lock()
 
     def _open(self, index=None):
         """Open a camera and check it delivers a picture; None if it doesn't."""
@@ -2030,6 +2060,13 @@ class Camera:
                     self.generation += 1
                     return True
         return False
+
+    def _forget_reconnect(self):
+        with self._guard:
+            self._attempt += 1
+            if self._opened is not None:
+                self._opened.release()
+                self._opened = None
 
     @property
     def ok(self):
@@ -2063,22 +2100,32 @@ class Camera:
                 break
 
     def _reconnect(self):
-        if self._opened is not None:
-            self.cap, self._opened = self._opened, None
+        with self._guard:
+            opened, self._opened = self._opened, None
+        if opened is not None:
+            self.cap = opened
             self.generation += 1
             print("Camera reconnected.")
             return
         if (self._opener is not None and self._opener.is_alive()) or time.monotonic() < self._retry_at:
             return
         self._retry_at = time.monotonic() + self.RETRY_SECONDS
+        attempt, index = self._attempt, self.index
 
         def work():
-            self._opened = self._open()
+            cap = self._open(index)
+            with self._guard:
+                if attempt == self._attempt:
+                    self._opened = cap
+                    return
+            if cap is not None:
+                cap.release()           # the camera was switched or closed meanwhile
 
         self._opener = threading.Thread(target=work, daemon=True)
         self._opener.start()
 
     def release(self):
+        self._forget_reconnect()
         if self.cap is not None:
             self.cap.release()
             self.cap = None
@@ -2469,6 +2516,7 @@ class App:
         self._caps = False
         self._audio_len = (None, None)
         self._draw_failed = False
+        self._camera_trouble = None
 
     # -- running
 
@@ -2528,23 +2576,42 @@ class App:
 
     def after_modal(self):
         self.drag = None
+        self.slider_drag = None
+        # Wait a whole auto-snap gap for a fresh picture: the last one is from
+        # before that screen opened, and things may have moved since.
+        self.next_auto = time.monotonic() + AUTO_CAPTURE_SECONDS
         self.camera.flush()
 
     def read_camera(self):
         """Take the newest picture from the camera: the right way up, with the
         camera settings applied, and cropped to fit the movie."""
-        self.cam_setup.sync(self.camera)
+        try:
+            self.cam_setup.sync(self.camera)
+        except Exception as e:
+            self.camera_trouble(e)
         frame = self.camera.read()
         if frame is None:
             if not self.camera.ok:
                 self.live = None
             return
-        frame = self.cam_setup.process(frame)
+        size = self.project.size if self.project is not None and self.project.frame_count() else None
+        try:
+            frame = self.cam_setup.process(frame, size)
+        except Exception as e:
+            self.camera_trouble(e)
+            self.cam_setup.matches.clear()
+            frame = fill_image(frame, size) if size else frame
         for note in self.cam_setup.take_notes():
             self.toast(note)
-        if self.project is not None and self.project.frame_count():
-            frame = fill_image(frame, self.project.size)
         self.live = frame
+
+    def camera_trouble(self, error):
+        """Something unexpected from the camera controls: say so, and keep going."""
+        text = f"Camera trouble: {error}"
+        if text != self._camera_trouble:
+            traceback.print_exc()
+            self._camera_trouble = text
+            self.toast(text, "error", 6)
 
     def studio(self):
         while self.running:
@@ -2572,13 +2639,14 @@ class App:
             self.safely(self.auto_tick)
 
     def set_project(self, project):
-        if project is not self.project and not project.lock():
+        if project is not self.project and project._lock_file is None and not project.lock():
             raise ProjectError("That movie is already open in another window.")
         if self.project is not None and self.project is not project:
-            try:
-                self.project.tidy()
-            except OSError:
-                pass
+            if self.project.folder != project.folder:     # (not when it's the same movie, reopened)
+                try:
+                    self.project.tidy()
+                except OSError:
+                    pass
             self.project.unlock()
         self.project = project
         self.renderer = Renderer(project)
@@ -3147,7 +3215,7 @@ class App:
                 self.cycle_transition(action[1])
             elif action[0] == "scroll":
                 self.tl_first += action[1] * (TILES_FIT - 1)
-        elif kind == "drag" and self.slider_drag is not None:
+        elif kind == "drag" and self.slider_drag is not None and self.camera_panel:
             self.slide(self.slider_drag, x)
         elif kind == "up" and self.slider_drag is not None:
             self.slider_drag = None
@@ -3169,13 +3237,16 @@ class App:
 
     def slide(self, name, x):
         x0, x1 = self.slider_rects.get(name, (0, 1))
-        self.cam_setup.set_slider(name, (x - x0) / max(1, x1 - x0))
+        problem = self.cam_setup.set_slider(name, (x - x0) / max(1, x1 - x0))
+        if problem:
+            self.toast(problem, "error")
 
     def run_camera(self, action):
         """The camera panel's buttons and keys."""
         cam = self.cam_setup
         if action == "close":
             self.camera_panel = False
+            self.slider_drag = None
         elif action == "switch":
             if self.camera.switch():
                 cam.sync(self.camera)
@@ -3431,9 +3502,9 @@ class App:
 
     def cmd_camera(self):
         self.camera_panel = not self.camera_panel
+        self.slider_drag = None
         if self.camera_panel:
             self.cursor = None            # the panel is for the live camera
-            self.slider_drag = None
 
     def cmd_help(self):
         c = self.backdrop()
@@ -3980,9 +4051,16 @@ class App:
         return self.open_path(entry["path"])
 
     def open_path(self, path):
+        # Let go of our own lock for a moment, so this window can reopen (or go
+        # back to a backup of) the movie it already has open.
+        current = self.project
+        if current is not None:
+            current.unlock()
         try:
-            self.set_project(Project.open(path, self.projects_dir))
+            self.set_project(Project.open(path, self.projects_dir, lock=True))
         except (ProjectError, OSError) as e:
+            if current is not None and self.project is current:
+                current.lock()
             self.toast(f"Couldn't open that: {e}", "error", 6)
             return False
         return True

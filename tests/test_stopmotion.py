@@ -186,6 +186,19 @@ class ProjectFileTests(TempDirTest):
         self.assertIsNotNone(display.last)
         self.assertIsNone(app.audio_seconds())
 
+    def test_undo_brings_back_the_movie_size(self):
+        p = sm.Project.create("Movie", self.tmp)
+        with p.change():
+            p.add_frame(solid(RED, (320, 180)), 0)
+        with p.change():
+            p.items.clear()
+        with p.change():
+            p.add_frame(solid(BLUE, (160, 120)), 0)          # a different camera
+        self.assertEqual(p.size, (160, 120))
+        p.undo()
+        p.undo()
+        self.assertEqual(p.size, (320, 180))
+
     def test_open_rejects_other_files(self):
         other = self.tmp / "notes.txt"
         other.write_text("hi")
@@ -608,6 +621,17 @@ class StudioTests(TempDirTest):
         self.assertIsNone(app.drag)
         self.assertEqual(app.insert_at, 2)
 
+    def test_auto_snap_waits_for_a_fresh_picture_after_another_screen(self):
+        cam = FakeCamera(RED)
+
+        def time_passes_and_things_move():
+            self.app.next_auto = 0                      # the gap is over while help is showing...
+            cam.color = BLUE                            # ...and the puppet has moved
+
+        script = ["t", None, "h", time_passes_and_things_move, "x", None, None]
+        app, _ = self.open_app(script, cam)
+        self.assertEqual(app.project.items, [])         # no stale red picture snapped
+
     def test_title_card(self):
         script = ["space", None, "c"] + list("Hi Mom") + ["tab", "b", "y", " ", "S", "a", "m", "backspace",
                                                         "right", "enter", None]
@@ -822,12 +846,89 @@ class CameraControlTests(TempDirTest):
         sizes = {cv2.imread(str(self.app.project.file_path(it["file"]))).shape for it in self.app.project.items}
         self.assertEqual(sizes, {(720, 1280, 3)})
 
+    def test_the_same_camera_coming_back_keeps_its_locks(self):
+        seen = {}
+
+        def reconnect():
+            self.cam.generation += 1                    # dropped out and came back
+            self.uvc.values[sm.FOCUS_AUTO] = 1          # a replugged camera starts on auto
+
+        script = ["k", None, "f", "]", None, reconnect, None, None,
+                  lambda: seen.update(auto=self.uvc.values[sm.FOCUS_AUTO], focus=self.uvc.values[sm.FOCUS])]
+        app, _ = self.open_studio(script)
+        self.assertEqual(seen, {"auto": 0, "focus": 105})
+        self.assertIn("camera is back", app.toast_text)
+
+    def test_a_failed_change_is_reported(self):
+        def broken(control, value):
+            raise OSError("LIBUSB_ERROR_PIPE")
+
+        script = ["k", None, "f", lambda: setattr(self.uvc, "set", broken), "]", None]
+        app, _ = self.open_studio(script)
+        self.assertIn("Couldn't set focus", app.toast_text)
+
+    def test_slider_drags_end_when_the_panel_closes(self):
+        seen = {}
+
+        def press_on_focus_slider():
+            x0, x1 = self.app.slider_rects["focus"]
+            rect = next(r for r, action in self.app.hotspots if action == ("slider", "focus"))
+            self.y = (rect[1] + rect[3]) // 2
+            self.app.display.events.append(("down", x0, self.y))
+
+        script = ["k", None, press_on_focus_slider, None, lambda: seen.update(before=self.uvc.values[sm.FOCUS]),
+                  "k", None, lambda: self.app.display.events.append(("drag", sm.CANVAS_W - 20, self.y)), None,
+                  lambda: seen.update(after=self.uvc.values[sm.FOCUS])]
+        self.open_studio(script)
+        self.assertEqual(seen["before"], seen["after"])
+
+    def test_camera_trouble_doesnt_end_the_session(self):
+        cam = FakeCamera(RED)
+        project = sm.Project.create("Movie", self.tmp)
+        self.app, _ = make_app(self.tmp, [None, "space", None], cam)
+        self.app.cam_setup.make_controls = mock.Mock(side_effect=RuntimeError("no name"))
+        with mock.patch("builtins.print"), mock.patch("traceback.print_exc"):
+            run(self.app, project.path)
+        self.assertEqual(len(self.app.project.items), 1)             # still took the picture
+        self.assertIn("Camera trouble", self.app.toast_text)
+
     def test_clicking_the_status_opens_the_panel(self):
         def click_status():
             rect = next(r for r, action in self.app.hotspots if action == ("cmd", "camera") and r[1] < sm.VIEW_Y + 60)
             self.app.display.events += [("down", rect[0] + 5, rect[1] + 5), ("up", rect[0] + 5, rect[1] + 5)]
 
         self.open_studio([None, click_status, None, lambda: self.assertTrue(self.app.camera_panel)])
+
+
+class CameraReconnectTests(unittest.TestCase):
+    def test_a_reconnect_that_finishes_after_a_switch_is_thrown_away(self):
+        import threading
+        release_camera_0 = threading.Event()
+        opened = []
+
+        class Cap:
+            def __init__(self, index):
+                self.index, self.released = index, False
+                opened.append(self)
+
+            def release(self):
+                self.released = True
+
+        def fake_open(index=None):
+            if index == 0:
+                release_camera_0.wait(5)            # camera 0 is slow to come back
+            return Cap(index)
+
+        cam = sm.Camera(0)
+        cam._open = fake_open
+        cam.read()                                  # no camera yet: starts reconnecting to camera 0
+        self.assertTrue(cam.switch())               # meanwhile, switch to camera 1
+        release_camera_0.set()
+        cam._opener.join(5)
+        cam._reconnect()                            # nothing stale gets adopted
+        self.assertEqual(cam.cap.index, 1)
+        stale = [c for c in opened if c.index == 0]
+        self.assertTrue(stale and all(c.released for c in stale))
 
 
 class WindowTests(unittest.TestCase):
@@ -892,6 +993,40 @@ class PickerTests(TempDirTest):
             run(app, p.path)
         self.assertIsNone(app.project)
         self.assertIn("already open", app.toast_text)
+
+    def backup_with_one_picture(self):
+        p = sm.Project.create("Movie", self.tmp)
+        with p.change():
+            p.add_frame(solid(RED), 0)
+        p.save(backup=True)
+        with p.change():
+            p.add_frame(solid(BLUE), 1)
+            p.add_frame(solid(GREEN), 2)
+        p.save(backup=True)
+        backup = next(f for f in (p.folder / "backups").glob("*.stopmo") if len(sm.Project.load_doc(f)["items"]) == 1)
+        return p, backup
+
+    def test_opening_a_backup_while_another_window_has_the_movie_changes_nothing(self):
+        p, backup = self.backup_with_one_picture()
+        other = sm.Project.open(p.path, lock=True)
+        self.addCleanup(other.unlock)
+        app, _ = make_app(self.tmp, ["esc"])
+        with mock.patch("builtins.print"):
+            run(app, backup)
+        self.assertIsNone(app.project)
+        self.assertIn("already open", app.toast_text)
+        self.assertEqual(len(sm.Project.load_doc(p.path)["items"]), 3)      # untouched on disk
+
+    def test_going_back_to_a_backup_of_the_movie_you_have_open(self):
+        p, backup = self.backup_with_one_picture()
+        seen = {}
+        app, _ = make_app(self.tmp, [None, lambda: seen.update(ok=app.open_path(backup)), None,
+                                     lambda: seen.update(went_back=len(app.project.items)), "z", None])
+        with mock.patch("builtins.print"):
+            run(app, p.path)
+        self.assertEqual(seen, {"ok": True, "went_back": 1})
+        self.assertEqual(len(app.project.items), 3)                           # Z undid going back
+        self.assertEqual(len(list((p.folder / "trash").glob("*"))), 0)       # nothing thrown away
 
     def test_escape_at_start_quits(self):
         app, _ = make_app(self.tmp, ["esc"])
