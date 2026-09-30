@@ -1,15 +1,73 @@
 """Stand-ins for the webcam, the window and the microphone, so the whole
 studio can be driven by scripted key presses without any hardware."""
 
+import math
+
 import numpy as np
 
 import stopmotion as sm
 
 
+class FakeUVC:
+    """A pretend USB webcam's controls, behaving like a Logitech C920: on auto
+    it doesn't report the exposure / white balance it picked (it reports the
+    last value we set), and a coarse camera only really uses a few exposures."""
+
+    RANGES = {sm.FOCUS: (0, 250, 5), sm.EXPOSURE_TIME: (3, 2047, 1), sm.WHITE_BALANCE: (2000, 6500, 10)}
+
+    def __init__(self, auto_exposure=600, auto_white_balance=5000, exposure_steps=None, has_focus=True):
+        self.values = {sm.FOCUS: 100, sm.FOCUS_AUTO: 1, sm.AE_MODE: sm.AE_APERTURE_PRIORITY,
+                       sm.EXPOSURE_TIME: 300, sm.WHITE_BALANCE: 4000, sm.WHITE_BALANCE_AUTO: 1}
+        self.auto_exposure = auto_exposure
+        self.auto_white_balance = auto_white_balance
+        self.exposure_steps = exposure_steps
+        self.has_focus = has_focus
+        self.closed = False
+
+    def get(self, control, request=sm.GET_CUR):
+        if control in (sm.FOCUS, sm.FOCUS_AUTO) and not self.has_focus:
+            raise OSError("LIBUSB_ERROR_PIPE")
+        if control == sm.AE_MODE and request == sm.GET_RES:
+            return sm.AE_MANUAL | sm.AE_AUTO | sm.AE_APERTURE_PRIORITY
+        if control in self.RANGES and request != sm.GET_CUR:
+            low, high, step = self.RANGES[control]
+            return {sm.GET_MIN: low, sm.GET_MAX: high, sm.GET_RES: step}[request]
+        return self.values[control]
+
+    def set(self, control, value):
+        self.values[control] = int(value)
+
+    def close(self):
+        self.closed = True
+
+    def exposure(self):
+        if self.values[sm.AE_MODE] != sm.AE_MANUAL:
+            return self.auto_exposure
+        wanted = self.values[sm.EXPOSURE_TIME]
+        if self.exposure_steps:
+            return min(self.exposure_steps, key=lambda step: abs(math.log(step / wanted)))
+        return wanted
+
+    def white_balance(self):
+        return self.auto_white_balance if self.values[sm.WHITE_BALANCE_AUTO] else self.values[sm.WHITE_BALANCE]
+
+    def picture(self, size):
+        """What the camera sees: brighter with more exposure, redder with a higher white balance."""
+        light = min(1.0, 0.25 * self.exposure() / 600)
+        red, blue = light * math.sqrt(self.white_balance() / 5000), light * math.sqrt(5000 / self.white_balance())
+        pixel = [255 * min(1.0, v) ** (1 / 2.2) for v in (blue, light, red)]
+        w, h = size
+        return np.full((h, w, 3), pixel, np.uint8)
+
+
 class FakeCamera:
-    def __init__(self, color=(0, 0, 255), size=(1280, 720)):
+    def __init__(self, color=(0, 0, 255), size=(1280, 720), uvc=None, cameras=1):
         self.color = color
         self.size = size
+        self.uvc = uvc
+        self.cameras = cameras
+        self.index = 0
+        self.generation = 1
         self.cap = object()
         self.flushes = 0
 
@@ -18,8 +76,19 @@ class FakeCamera:
         return self.cap is not None
 
     def frame(self):
+        if self.uvc is not None:
+            return self.uvc.picture(self.size)
         w, h = self.size
-        return np.full((h, w, 3), self.color, np.uint8)
+        img = np.full((h, w, 3), self.color, np.uint8)
+        img[:h // 8, :w // 8] = 255          # a white corner, to tell which way up it is
+        return img
+
+    def switch(self):
+        if self.cameras < 2:
+            return False
+        self.index = (self.index + 1) % self.cameras
+        self.generation += 1
+        return True
 
     def read(self):
         return None if self.cap is None else self.frame()
@@ -123,7 +192,10 @@ class FakeSpeaker:
 
 def make_app(tmp, script=(), camera=None):
     display = FakeDisplay(script)
-    app = sm.App(display, camera or FakeCamera(), projects_dir=tmp)
+    camera = camera or FakeCamera()
+    app = sm.App(display, camera, projects_dir=tmp)
+    if camera.uvc is not None:
+        app.cam_setup.make_controls = lambda index: sm.CameraControls(index, usb=camera.uvc, name="Fake C920")
     app.speaker = FakeSpeaker()
     app.recorder_factory = FakeRecorder
     app.countdown_seconds = 0

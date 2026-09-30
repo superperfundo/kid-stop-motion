@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import stopmotion as sm  # noqa: E402
-from fakes import FakeCamera, FakeRecorder, make_app, run  # noqa: E402
+from fakes import FakeCamera, FakeRecorder, FakeUVC, make_app, run  # noqa: E402
 
 RED, BLUE, GREEN = (0, 0, 255), (255, 0, 0), (0, 255, 0)
 
@@ -551,7 +551,7 @@ class StudioTests(TempDirTest):
         script = ["space", "space", lambda: setattr(cam, "color", BLUE), None,
                   "home", None, "space", "space", None]
         app, _ = self.open_app(script, cam)
-        colors = [cv2.imread(str(app.project.file_path(it["file"])))[0, 0] for it in app.project.items]
+        colors = [cv2.imread(str(app.project.file_path(it["file"])))[360, 640] for it in app.project.items]
         self.assertEqual([int(c[2]) > 200 for c in colors], [True, False, True])
 
     def test_editing_keys(self):
@@ -579,7 +579,7 @@ class StudioTests(TempDirTest):
                   ("drag", x[0], y, x[2] - sm.TILE_W // 2 - 5, y), None]
         app, _ = self.open_app(script, cam)
         first = cv2.imread(str(app.project.file_path(app.project.items[0]["file"])))
-        self.assertGreater(first[0, 0, 0], 200)               # blue is first now
+        self.assertGreater(first[360, 640, 0], 200)           # blue is first now
         self.assertEqual(app.cursor, 1)
 
     def test_dragging_the_camera_while_auto_snap_fires(self):
@@ -668,6 +668,166 @@ class StudioTests(TempDirTest):
         cam.cap = None
         app, display = self.open_app(["space", None, "c", "H", "enter", None, "p", None, "x", None], cam)
         self.assertEqual([it["kind"] for it in app.project.items], ["title"])
+
+
+class CameraControlTests(TempDirTest):
+    """Focus / exposure / white balance, with a pretend USB webcam."""
+
+    def controls(self, **kwargs):
+        self.uvc = FakeUVC(**kwargs)
+        return sm.CameraControls(0, usb=self.uvc, name="Fake C920")
+
+    def test_controls_start_on_auto_and_go_back_to_auto(self):
+        controls = self.controls()
+        self.assertEqual(set(controls.settings), {"focus", "exposure", "white balance"})
+        self.assertEqual(self.uvc.values[sm.FOCUS_AUTO], 1)
+        self.assertEqual(controls.toggle("focus"), "Focus LOCKED at 100")
+        self.assertEqual(self.uvc.values[sm.FOCUS_AUTO], 0)
+        self.assertEqual(controls.toggle("focus"), "Focus on AUTO")
+        controls.toggle("focus")
+        controls.close()
+        self.assertEqual(self.uvc.values[sm.FOCUS_AUTO], 1)
+        self.assertTrue(self.uvc.closed)
+
+    def test_a_camera_only_gets_the_controls_it_has(self):
+        controls = self.controls(has_focus=False)
+        self.assertEqual(set(controls.settings), {"exposure", "white balance"})
+        self.assertIn("can't lock focus", controls.toggle("focus"))
+        none = sm.CameraControls(0)
+        self.assertEqual(none.settings, {})
+        self.assertIn("no focus", none.summary())
+
+    def test_exposure_slider_is_even_in_stops(self):
+        exposure = self.controls().settings["exposure"]
+        self.assertEqual(exposure.to_slider(3), 0)
+        self.assertEqual(exposure.to_slider(2047), 100)
+        self.assertAlmostEqual(exposure.from_slider(50), (3 * 2047) ** 0.5, delta=1)
+
+    def open_studio(self, script, **uvc):
+        self.uvc = FakeUVC(**uvc)
+        self.cam = FakeCamera(uvc=self.uvc)
+        project = sm.Project.create("Movie", self.tmp)
+        app, display = make_app(self.tmp, script, self.cam)
+        self.app = app
+        with mock.patch("builtins.print"):
+            run(app, project.path)
+        return app, display
+
+    def test_locking_exposure_matches_how_auto_had_it(self):
+        seen = {}
+        script = ["k", None, "x"] + [None] * 80 + [lambda: seen.update(ae=self.uvc.values[sm.AE_MODE],
+                                                                           exposure=self.uvc.exposure())]
+        app, _ = self.open_studio(script, auto_exposure=600)
+        self.assertEqual(seen["ae"], sm.AE_MANUAL)
+        self.assertAlmostEqual(seen["exposure"], 600, delta=30)
+        self.assertIn("Exposure LOCKED", app.toast_text)
+        self.assertNotEqual(self.uvc.values[sm.AE_MODE], sm.AE_MANUAL)     # back on auto after quitting
+
+    def test_coarse_cameras_lock_to_the_nearest_step_and_say_so(self):
+        seen = {}
+        script = ["k", None, "x"] + [None] * 100 + [lambda: seen.update(exposure=self.uvc.exposure())]
+        app, _ = self.open_studio(script, auto_exposure=450, exposure_steps=[75, 150, 300, 625, 1250])
+        self.assertIn(seen["exposure"], (300, 625))
+        self.assertIn("as close as this camera gets", app.toast_text)
+
+    def test_locking_white_balance(self):
+        seen = {}
+        script = ["k", None, "w"] + [None] * 80 + [lambda: seen.update(wb=self.uvc.white_balance(),
+                                                                           auto=self.uvc.values[sm.WHITE_BALANCE_AUTO])]
+        app, _ = self.open_studio(script, auto_white_balance=5200)
+        self.assertEqual(seen["auto"], 0)
+        self.assertAlmostEqual(seen["wb"], 5200, delta=250)
+
+    def test_focus_nudges_sliders_and_brighter(self):
+        seen = {}
+        script = ["k", None, "f", "]", "]", None, lambda: seen.update(focus=self.uvc.values[sm.FOCUS])]
+        slider_x = sm.CANVAS_W - 20           # the far right end of a slider
+        script += [lambda: self.display_click_slider("focus", slider_x), None,
+                   lambda: seen.update(slid=self.uvc.values[sm.FOCUS])]
+        self.open_studio(script)
+        self.assertEqual(seen["focus"], 110)
+        self.assertEqual(seen["slid"], 250)
+
+    def display_click_slider(self, name, x):
+        x0, x1 = self.app.slider_rects[name]
+        rect = next(r for r, action in self.app.hotspots if action == ("slider", name))
+        self.app.display.events += [("down", x0 + 2, (rect[1] + rect[3]) // 2), ("drag", x, (rect[1] + rect[3]) // 2),
+                                    ("up", x, (rect[1] + rect[3]) // 2)]
+
+    def test_brighter_and_darker_when_locked(self):
+        seen = {}
+        script = ["k", None, "x"] + [None] * 80 + [lambda: seen.update(before=self.uvc.values[sm.EXPOSURE_TIME]),
+                                                   "+", "+", "+", None,
+                                                   lambda: seen.update(after=self.uvc.values[sm.EXPOSURE_TIME])]
+        self.open_studio(script)
+        self.assertAlmostEqual(seen["after"] / seen["before"], 2.0, delta=0.1)     # 3 thirds of a stop
+
+    def test_panel_keys_only_work_while_it_is_open(self):
+        cam = FakeCamera(RED)
+        script = ["space", "space", None, "k", "x", "c", "esc", None,
+                  lambda: self.assertFalse(self.app.camera_panel), "x", None]
+        project = sm.Project.create("Movie", self.tmp)
+        app, _ = make_app(self.tmp, script, cam)
+        self.app = app
+        with mock.patch("builtins.print"):
+            run(app, project.path)
+        self.assertEqual(len(app.project.items), 1)          # only the X after closing deleted anything
+        self.assertTrue(app.running)                         # ESC closed the panel, didn't start quitting
+
+    def test_software_brightness_on_cameras_without_controls(self):
+        seen = {}
+        cam = FakeCamera((100, 100, 100))
+        script = [None, lambda: seen.update(before=int(self.app.live[400, 600, 0])), "k", "+", "+", "+", None,
+                  lambda: seen.update(after=int(self.app.live[400, 600, 0]))]
+        project = sm.Project.create("Movie", self.tmp)
+        self.app, _ = make_app(self.tmp, script, cam)
+        run(self.app, project.path)
+        self.assertGreater(seen["after"], seen["before"] * 1.25)
+
+    def test_flip_is_remembered_for_each_camera(self):
+        cam = FakeCamera(RED)
+        project = sm.Project.create("Movie", self.tmp)
+        self.app, _ = make_app(self.tmp, [None, "k", "r", None, "space", None], cam)
+        with mock.patch("builtins.print"):
+            run(self.app, project.path)
+        saved = cv2.imread(str(self.app.project.file_path(self.app.project.items[0]["file"])))
+        self.assertEqual(int(saved[-5, -5, 1]), 255)               # the white corner is bottom-right now
+        again, _ = make_app(self.tmp, [None], FakeCamera(RED))
+        with mock.patch("builtins.print"):
+            run(again, project.path)
+        self.assertEqual(json.loads((self.tmp / sm.SETTINGS_FILE).read_text()), {"flip": {"Camera 1": True}})
+        self.assertEqual(int(again.live[-5, -5, 1]), 255)             # still flipped next time
+
+    def test_switching_cameras(self):
+        cam = FakeCamera(RED, cameras=2)
+        project = sm.Project.create("Movie", self.tmp)
+        self.app, _ = make_app(self.tmp, ["k", "c", None], cam)
+        with mock.patch("builtins.print"):
+            run(self.app, project.path)
+        self.assertEqual(cam.index, 1)
+        self.assertIn("Camera 2", self.app.toast_text)
+        lonely = FakeCamera(RED)
+        self.app, _ = make_app(self.tmp, ["k", "c", None], lonely)
+        with mock.patch("builtins.print"):
+            run(self.app, project.path)
+        self.assertIn("No other camera", self.app.toast_text)
+
+    def test_pictures_from_another_camera_fit_the_movie(self):
+        cam = FakeCamera(RED)
+        project = sm.Project.create("Movie", self.tmp)
+        script = ["space", lambda: setattr(cam, "size", (640, 480)), None, "space", None]
+        self.app, _ = make_app(self.tmp, script, cam)
+        with mock.patch("builtins.print"):
+            run(self.app, project.path)
+        sizes = {cv2.imread(str(self.app.project.file_path(it["file"]))).shape for it in self.app.project.items}
+        self.assertEqual(sizes, {(720, 1280, 3)})
+
+    def test_clicking_the_status_opens_the_panel(self):
+        def click_status():
+            rect = next(r for r, action in self.app.hotspots if action == ("cmd", "camera") and r[1] < sm.VIEW_Y + 60)
+            self.app.display.events += [("down", rect[0] + 5, rect[1] + 5), ("up", rect[0] + 5, rect[1] + 5)]
+
+        self.open_studio([None, click_status, None, lambda: self.assertTrue(self.app.camera_panel)])
 
 
 class WindowTests(unittest.TestCase):

@@ -1,2 +1,3 @@
 opencv-python
 sounddevice
+libusb-package; sys_platform == "darwin"

@@ -25,12 +25,14 @@ It's one Python file. No accounts, no cloud, no uploads: everything stays on you
   track that plays with the movie and goes into the MP4.
 - **Auto-snap, a picture goal and a speed control.** `T` takes a picture every 2 seconds, `N`
   sets a goal with a progress bar, `V` makes the movie faster or slower.
+- **A steady picture.** In the camera panel (`K`), lock focus, exposure and white balance so the
+  movie doesn't flicker or go soft when a hand reaches in; switch cameras; flip the picture.
 - **Nothing gets lost.** Every picture is saved the moment it's taken. There's no "save"
   step to forget.
 
 ## Setup
 
-You need Python 3.9+ and [ffmpeg](https://ffmpeg.org/) (used to write the MP4 with sound).
+You need Python 3.9 or newer. The `python3` that comes with macOS is fine.
 
 ```bash
 git clone https://github.com/superperfundo/kid-stop-motion.git
@@ -38,18 +40,14 @@ cd kid-stop-motion
 python3 -m pip install -r requirements.txt
 ```
 
-Install ffmpeg on macOS with [Homebrew](https://brew.sh/):
+That installs OpenCV, [sounddevice](https://python-sounddevice.readthedocs.io/) for the
+microphone, and on macOS a ready-built libusb for the camera controls. If sounddevice isn't there,
+everything except sound still works.
 
-```bash
-brew install ffmpeg
-```
-
-On Debian/Ubuntu: `sudo apt install ffmpeg libportaudio2` (the second one is for the
-microphone). On Windows, see the ffmpeg download page.
-
-`requirements.txt` installs OpenCV and [sounddevice](https://python-sounddevice.readthedocs.io/)
-(for the microphone). If sounddevice isn't there, everything except sound still works. Without
-ffmpeg, movies are still made, just without sound.
+[ffmpeg](https://ffmpeg.org/) is optional but recommended: it's what puts your voice track into
+the MP4. Without it, OpenCV's built-in encoder makes the movie, without sound. To install it on
+macOS with [Homebrew](https://brew.sh/): `brew install ffmpeg`. On Debian/Ubuntu:
+`sudo apt install ffmpeg libportaudio2` (the second one is for the microphone).
 
 ## Run it
 
@@ -59,7 +57,8 @@ python3 stopmotion.py
 
 First you'll see your movies: pick one to keep working on, or **New movie**. Then the studio
 opens with the live camera, big buttons down the right, and the timeline along the bottom. If
-the picture is upside down, see [Settings](#settings): there's a one-line switch for that.
+the picture is upside down, press `K` then `R` (it remembers, for each camera). If it's the wrong
+camera, press `K` then `C`.
 
 | Key | What it does |
 | --- | --- |
@@ -73,6 +72,7 @@ the picture is upside down, see [Settings](#settings): there's a one-line switch
 | `V` | Speed: pictures per second |
 | `E` | Make an MP4 movie |
 | `L` | Your movies: open another one, or start a new one |
+| `K` | Camera panel: switch camera, flip, lock focus / exposure / white balance ([below](#focus-exposure-and-white-balance)) |
 | `<` `>` or `,` `.` | Pick a picture. `HOME` / `END` jump to the start / the camera at the end. |
 | `X` (or Delete) | Delete the picked picture |
 | `D` | Copy the picked picture |
@@ -158,9 +158,67 @@ Stop Motion Projects/
   records until you press a key, which is handy for recording the lines first and animating to
   them. Press `R` again to record a new one or delete it. `Z` undoes either.
 
+## Focus, exposure and white balance
+
+Webcams keep adjusting focus, brightness and colour on their own. That's fine for video calls, but
+in stop motion it makes the movie flicker and go soft whenever a hand reaches into the shot. Once
+the picture looks right, press `K` to open the camera panel and lock it. While the panel is open:
+
+| Key | What it does |
+| --- | --- |
+| `F` / `X` / `W` | Lock or unlock focus / exposure / white balance |
+| `[` / `]` | Nudge focus |
+| `-` / `+` | Darker / brighter |
+| `C` | Switch to the next camera |
+| `R` | Flip the picture half a turn (remembered for each camera) |
+| `K` or `ESC` | Close the panel |
+
+(`SPACE` still takes pictures with the panel open. Outside the panel, those letters do their
+usual jobs.) Above the live picture, a label shows what's locked; click it to open the panel.
+
+- `F`, `X` and `W` lock focus, exposure and white balance where the camera has settled. Press
+  again to go back to auto. Webcams don't report the exposure or white balance their auto modes
+  pick, so `X` and `W` measure the picture and adjust for a moment until it matches how it looked
+  on auto. The picture holds still while that happens.
+- The **Focus**, **Exposure** and **White balance** sliders in the panel set a value by hand, and
+  lock it there. For fine focusing, `[` and `]` nudge focus a step at a time.
+- `-` and `+` make the exposure a third of a stop darker or brighter, and lock it (starting from
+  what auto had, if it was on auto). On cameras without exposure control, the app darkens or
+  brightens the picture itself instead.
+
+These controls work on macOS with USB webcams. The app talks to the camera directly with standard
+USB Video Class requests, which almost every USB webcam understands, because macOS's own camera
+APIs can't set a focus distance. Each camera gets the controls it actually has: a webcam with a
+fixed-focus lens, for instance, shows focus as `n/a` but can still lock exposure and white
+balance. Built-in laptop cameras aren't USB, so they show `n/a` for all three, and `-` / `+`
+brighten the picture in the app instead. The terminal lists what each camera can control. The app
+puts the camera back on auto when you switch cameras or quit. These controls aren't available on
+Windows or Linux yet; switching, flipping and `-` / `+` work everywhere.
+
+### How fine the control is depends on the camera
+
+The app can only use the settings a camera actually has, and some are coarser than they claim.
+Many webcams, the Logitech C920 included, accept any exposure time but only really use a handful,
+about a stop apart. On those cameras:
+
+- The Exposure slider and `-` / `+` only change the picture when they cross one of the camera's
+  steps. In between, the number changes but the picture doesn't.
+- `X` can only lock to the nearest step, so the locked picture may be a bit brighter or darker
+  than it was on auto. The studio says so when that happens, e.g.
+  `Exposure LOCKED at 76ms (as close as this camera gets: 0.4 stops brighter)`.
+
+The app doesn't paper over this by turning up the camera's gain, which would add noise. If you
+need something in between, adjust the light instead: move a lamp closer or further away, or put a
+sheet of paper over it.
+
+If you switch cameras partway through a movie, new pictures are cropped to match the size of the
+movie's first picture, so the movie still exports cleanly.
+
 ## Tips for a good shoot
 
 - Tape the camera down, or every frame will jump.
+- Once the shot is set up, lock focus, exposure and white balance (`K`, then `F`, `X` and `W`)
+  so the camera doesn't refocus or change colour every time a hand reaches in.
 - Turn off automatic room lights and close the curtains if you can. Changing daylight makes the
   movie flicker.
 - Move things a *little* between shots. Small moves look smooth; big moves look jumpy.
@@ -171,13 +229,14 @@ Stop Motion Projects/
 
 Near the top of `stopmotion.py`:
 
-- `ROTATE_180 = True`: the picture is rotated half a turn by default, because most tabletop rigs
-  end up with the camera clamped upside down. **If your picture appears upside down, set this to
-  `False`.**
+- `ROTATE_180 = False`: set this to `True` if your cameras are usually mounted upside down
+  (tabletop rigs often end up that way), so the picture starts the right way up. `K` then `R`
+  flips it for the camera you're using, and that's remembered.
 - `FPS = 12`: pictures per second for new movies. (Each movie remembers its own speed; change
   it in the studio with `V`.)
-- `CAMERA_INDEX = 0`: which webcam to use. Try `1` for a second camera, or run
-  `python3 stopmotion.py --camera 1`.
+- `CAMERA_INDEX = 0`: which camera to start with (or run `python3 stopmotion.py --camera 1`).
+  `K` then `C` switches while you work.
+- `EXPOSURE_STEP = 1 / 3`: how many stops each `-` / `+` changes the exposure by.
 - `PROJECTS_DIR`: where new movies go (or run with `--projects-dir some/folder`).
 - `ONION_OPACITY`, `AUTO_CAPTURE_SECONDS`, `TITLE_SECONDS`, `TRANSITION_SECONDS`,
   `SHUTTER_SOUND`.
