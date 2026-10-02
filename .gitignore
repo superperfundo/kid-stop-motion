@@ -1,8 +1,20 @@
-# Captured frames and exported movies stay on your own machine
+# Pictures, sound and movies stay on your own machine
 stopmotion_project_*/
+Stop Motion Projects/
+*.stopmo
+*.stopmo.*
+frames/
+audio/
+backups/
+trash/
+Open *.command
+Open *.sh
+Open *.bat
+.in-use
 stop_motion_export*.mp4
 stopmotion_*.mp4
 *.mp4
+*.wav
 frame_*.png
 
 # Environments
