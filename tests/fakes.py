@@ -83,9 +83,11 @@ class FakeCamera:
         img[:h // 8, :w // 8] = 255          # a white corner, to tell which way up it is
         return img
 
-    def switch(self):
+    def switch(self, on_change=None):
         if self.cameras < 2:
             return False
+        if on_change is not None:
+            on_change()
         self.index = (self.index + 1) % self.cameras
         self.generation += 1
         return True
@@ -215,16 +217,28 @@ class FakeVideoCapture:
     """An OpenCV VideoCapture that answers size requests the way real cameras
     do. `modes` is {(w, h): fps}. A size it hasn't got gets, by `style`:
     "nearest" (macOS, Linux), "default" (keeps what it had) or "fail" (Windows
-    DirectShow: no pictures until a size it has is asked for)."""
+    DirectShow: no pictures until a size it has is asked for).
 
-    def __init__(self, modes, style="nearest", start=(640, 480), backend="AVFOUNDATION"):
+    Pictures arrive on a pretend clock (`clock`) at the mode's real rate;
+    `raw` gives slower rates for uncompressed pictures, and `dshow` makes
+    every new size go back to uncompressed, as DirectShow does. What it
+    reports as its frame rate is always 30, true or not, like many drivers."""
+
+    def __init__(self, modes, style="nearest", start=(640, 480), backend="AVFOUNDATION", raw=None, dshow=False):
         self.modes = dict(modes)
         self.style = style
         self.size = start
         self.backend = backend
+        self.raw = dict(raw or {})
+        self.dshow = dshow
         self.asked = []
+        self.log = []             # every property set, in order
         self.fourcc = None
+        self.now = 0.0
         self._want = {}
+
+    def clock(self):
+        return self.now
 
     def isOpened(self):
         return True
@@ -234,8 +248,13 @@ class FakeVideoCapture:
 
     def set(self, prop, value):
         import cv2
+        names = {cv2.CAP_PROP_FOURCC: "fourcc", cv2.CAP_PROP_FPS: "fps",
+                 cv2.CAP_PROP_FRAME_WIDTH: "width", cv2.CAP_PROP_FRAME_HEIGHT: "height"}
+        self.log.append(names.get(prop, prop))
         if prop == cv2.CAP_PROP_FOURCC:
             self.fourcc = value
+            return True
+        if prop == cv2.CAP_PROP_FPS:
             return True
         if prop in (cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT):
             self._want[prop] = int(value)
@@ -249,18 +268,27 @@ class FakeVideoCapture:
                     self.size = min(self.modes, key=lambda m: abs(m[0] - want[0]) + abs(m[1] - want[1]))
                 elif self.style == "fail":
                     self.size = None
+                if self.dshow:
+                    self.fourcc = None
             return True
         return False
 
     def get(self, prop):
         import cv2
         if prop == cv2.CAP_PROP_FPS:
-            return self.modes.get(self.size, 0) if self.size else 0
+            return 30 if self.size else 0
         return 0
+
+    def rate(self):
+        import cv2
+        if self.fourcc != cv2.VideoWriter_fourcc(*"MJPG") and self.size in self.raw:
+            return self.raw[self.size]
+        return self.modes.get(self.size, 30)
 
     def read(self):
         if self.size is None:
             return False, None
+        self.now += 1 / self.rate()
         w, h = self.size
         return True, np.zeros((h, w, 3), np.uint8)
 
@@ -319,13 +347,15 @@ class FakeV4L2:
 class FakeDirectShow:
     """OpenCV's DirectShow capture as the app sees it: get() gives -1 for what
     the camera hasn't got (and for auto exposure, which DirectShow can't
-    report); set() refuses values outside the camera's real ranges. The
-    picture's brightness follows the exposure, like a real camera."""
+    report); set() refuses values outside the camera's real ranges, or off
+    its `steps`. The picture's brightness follows the exposure, like a real
+    camera."""
 
-    def __init__(self, ranges=None, missing=(), auto_exposure=-6):
+    def __init__(self, ranges=None, missing=(), auto_exposure=-6, steps=None):
         import cv2
         self.ranges = ranges or {cv2.CAP_PROP_EXPOSURE: (-11, -2), cv2.CAP_PROP_FOCUS: (0, 250),
                                  cv2.CAP_PROP_WB_TEMPERATURE: (2800, 6500)}
+        self.steps = steps or {}
         self.values = {cv2.CAP_PROP_EXPOSURE: -4, cv2.CAP_PROP_FOCUS: 0, cv2.CAP_PROP_WB_TEMPERATURE: 4000,
                        cv2.CAP_PROP_AUTOFOCUS: 1, cv2.CAP_PROP_AUTO_WB: 1, cv2.CAP_PROP_AUTO_EXPOSURE: 1}
         self.missing = set(missing)
@@ -345,6 +375,8 @@ class FakeDirectShow:
         if prop in self.missing:
             return False
         if prop in self.ranges and not self.ranges[prop][0] <= value <= self.ranges[prop][1]:
+            return False
+        if prop in self.steps and (value - self.ranges[prop][0]) % self.steps[prop]:
             return False
         if prop == cv2.CAP_PROP_AUTOFOCUS:
             value = 1 if round(value) == 1 else 2      # DirectShow's flags

@@ -202,12 +202,14 @@ Switching, flipping and `-` / `+` work with every camera.
   `video` group.
 - **Windows:** webcams, through DirectShow (the app opens cameras that way so it can reach their
   settings). Windows doesn't tell the app the ranges, so the sliders start from typical ones; if
-  the camera refuses a value, the app finds the nearest one it takes and remembers that limit.
-  Exposure on Windows moves in whole stops.
+  the camera refuses a value, the app moves on to the next one it takes, and when a slider goes
+  past the end of the camera's range, it finds where the range ends and shrinks the slider to
+  match. Exposure on Windows moves in whole stops, so `-` / `+` go a whole stop at a time.
 - **HDMI capture boxes** (a Cam Link or a cheap HDMI-to-USB dongle, for a camera with HDMI out)
   pass the picture along but not the camera's settings. The panel says "set it on the camera":
   use the camera's own manual focus, exposure and white balance, which is the best way to shoot
-  stop motion anyway.
+  stop motion anyway. The app spots them by name, or by having no focus or exposure control at
+  all.
 
 ### How fine the control is depends on the camera
 
@@ -254,7 +256,8 @@ Near the top of `stopmotion.py`:
   manage it give their best below it, and a size the camera only sends at under 10 pictures a
   second is skipped. Set `(1920, 1080)` for smaller files and a snappier studio on an older
   computer.
-- `EXPOSURE_STEP = 1 / 3`: how many stops each `-` / `+` changes the exposure by.
+- `EXPOSURE_STEP = 1 / 3`: how many stops each `-` / `+` changes the exposure by (at least a
+  whole stop on Windows, where cameras have nothing finer).
 - `PROJECTS_DIR`: where new movies go (or run with `--projects-dir some/folder`).
 - `ONION_OPACITY`, `AUTO_CAPTURE_SECONDS`, `TITLE_SECONDS`, `TRANSITION_SECONDS`,
   `SHUTTER_SOUND`.

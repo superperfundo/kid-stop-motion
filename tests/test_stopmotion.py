@@ -933,12 +933,33 @@ class CameraReconnectTests(unittest.TestCase):
         self.assertTrue(stale and all(c.released for c in stale))
 
 
+class CameraSwitchTests(unittest.TestCase):
+    def test_the_old_camera_is_put_back_on_auto_before_it_is_let_go(self):
+        events = []
+
+        class Cap(FakeVideoCapture):
+            def release(self):
+                events.append(("release", self.name))
+
+        def opener(index=None):
+            cap = Cap({(1280, 720): 30})
+            cap.name = index
+            return cap
+
+        cam = sm.Camera(0)
+        with mock.patch.object(cam, "_open", opener):
+            cam.start()
+            self.assertTrue(cam.switch(on_change=lambda: events.append(("auto", cam.cap.name))))
+        self.assertEqual(events, [("auto", None), ("release", None)])
+        self.assertEqual((cam.index, cam.cap.name), (1, 1))
+
+
 class CameraSizeTests(unittest.TestCase):
     """Asking each camera for its sharpest picture."""
 
     def choose(self, cap, platform="mac"):
         with mock.patch.object(sm, "camera_platform", return_value=platform):
-            return sm.choose_camera_size(cap), cap.size
+            return sm.choose_camera_size(cap, clock=cap.clock), cap.size
 
     def test_a_1080p_camera_gets_1080p(self):
         cap = FakeVideoCapture({(1920, 1080): 30, (1280, 720): 30, (640, 480): 30})
@@ -972,6 +993,40 @@ class CameraSizeTests(unittest.TestCase):
         cap = FakeVideoCapture({(1280, 720): 30}, style="fail", start=None)
         cap.modes = {}
         self.assertFalse(self.choose(cap)[0])
+
+    def test_frame_rates_are_timed_not_taken_on_trust(self):
+        cap = FakeVideoCapture({(1920, 1080): 5, (1280, 720): 30})    # says 30 at 1080p, sends 5
+        self.assertEqual(self.choose(cap), (True, (1280, 720)))
+
+    def test_slow_big_sizes_give_way_to_a_quick_smaller_one(self):
+        cap = FakeVideoCapture({(1920, 1080): 5, (800, 600): 30}, start=(800, 600))
+        self.assertEqual(self.choose(cap), (True, (800, 600)))
+
+    def test_four_by_three_cameras_keep_their_biggest_quick_picture(self):
+        cap = FakeVideoCapture({(2592, 1944): 15, (1600, 1200): 30, (640, 480): 30})
+        self.assertEqual(self.choose(cap), (True, (2592, 1944)))
+
+    def test_a_camera_that_ignores_a_size_is_still_asked_for_the_next(self):
+        # macOS keeps its current picture for a size it hasn't got; that says nothing about smaller sizes.
+        cap = FakeVideoCapture({(1920, 1080): 30, (1280, 720): 30}, style="default", start=(1280, 720))
+        self.assertEqual(self.choose(cap), (True, (1920, 1080)))
+
+    def test_each_platform_asks_in_the_order_its_driver_needs(self):
+        # DirectShow takes the frame rate for every size it sets up, but its
+        # compression only for the size already set, so that comes after.
+        windows = FakeVideoCapture({(1920, 1080): 30, (1280, 720): 30}, style="fail",
+                                   raw={(1920, 1080): 5}, dshow=True, backend="DSHOW")
+        self.assertEqual(self.choose(windows, "windows"), (True, (1920, 1080)))
+        self.assertEqual(windows.log[0], "fps")
+        self.assertEqual(windows.log[-3:], ["width", "height", "fourcc"])
+        # V4L2 keeps its compression, but its frame rate needs asking again after each size.
+        linux = FakeVideoCapture({(1920, 1080): 30}, raw={(1920, 1080): 5}, backend="V4L2")
+        self.assertEqual(self.choose(linux, "linux"), (True, (1920, 1080)))
+        self.assertEqual(linux.log[0], "fourcc")
+        self.assertEqual(linux.log[-3:], ["width", "height", "fps"])
+        mac = FakeVideoCapture({(1920, 1080): 30})
+        self.choose(mac)
+        self.assertNotIn("fourcc", mac.log)
 
     def test_windows_opens_through_directshow_first(self):
         calls = []
@@ -1100,6 +1155,49 @@ class WindowsControlTests(TempDirTest):
         self.assertEqual(controls.settings, {})
         self.assertIn("DirectShow", controls.problem)
 
+    def test_a_focus_that_moves_in_fives(self):
+        controls = self.controls(steps={cv2.CAP_PROP_FOCUS: 5})
+        focus = controls.settings["focus"]
+        controls.set_value("focus", 3)
+        self.assertEqual((self.ds.values[cv2.CAP_PROP_FOCUS], focus.value), (5, 5))  # the next one it takes
+        controls.set_value("focus", focus.value + focus.step)                       # what ] does
+        self.assertEqual(focus.value, 10)
+        controls.set_value("focus", 255)
+        self.assertEqual((focus.value, focus.max), (250, 250))  # the real end, not a step it skipped
+        controls.set_value("focus", 0)
+        self.assertEqual((focus.value, focus.min), (0, 0))
+
+    def test_a_white_balance_that_moves_in_fifties(self):
+        controls = self.controls(steps={cv2.CAP_PROP_WB_TEMPERATURE: 50})
+        controls.set_value("white balance", 4010)
+        self.assertEqual(controls.settings["white balance"].value, 4050)
+        controls.set_value("white balance", 10000)
+        self.assertEqual(controls.settings["white balance"].max, 6500)
+        controls.set_value("white balance", 0)
+        self.assertEqual(controls.settings["white balance"].min, 2800)
+
+    def test_the_panel_shows_what_the_camera_took(self):
+        controls = self.controls()
+        controls.set_value("exposure", 300)                    # 30 ms: between 1/64 s and 1/32 s
+        self.assertEqual(self.ds.values[cv2.CAP_PROP_EXPOSURE], -5)
+        self.assertEqual(controls.describe("exposure"), "31.25ms")
+
+    def test_minus_and_plus_move_a_whole_stop(self):
+        setup = sm.CameraSetup(self.tmp / "settings.json")
+        setup.controls = self.controls()
+        setup.controls.set_value("exposure", 10000 / 64)       # 2^-6 s
+        setup.brighter(1)
+        self.assertEqual(self.ds.values[cv2.CAP_PROP_EXPOSURE], -5)
+        setup.brighter(-1)
+        setup.brighter(-1)
+        self.assertEqual(self.ds.values[cv2.CAP_PROP_EXPOSURE], -7)
+
+    def test_half_a_second_is_an_exposure_not_a_missing_control(self):
+        controls = self.controls()
+        self.ds.values[cv2.CAP_PROP_EXPOSURE] = -1             # auto, in the dark (OpenCV's "missing" too)
+        controls.refresh()
+        self.assertEqual(controls.settings["exposure"].value, 5000)
+
     def test_locking_exposure_by_matching_the_picture(self):
         ds = FakeDirectShow(auto_exposure=-6)
         cam = FakeCamera()
@@ -1140,6 +1238,15 @@ class CaptureBoxTests(TempDirTest):
     def test_a_real_webcam_is_not_a_capture_box(self):
         self.assertFalse(sm.CameraControls(0, usb=FakeUVC(), name="Elgato Facecam").capture_box)
         self.assertFalse(sm.CameraControls(0, usb=FakeUVC(has_focus=False), name="USB Video").capture_box)
+
+    def test_windows_and_linux_devices_with_neither_focus_nor_exposure(self):
+        props = {cv2.CAP_PROP_FOCUS, cv2.CAP_PROP_AUTOFOCUS, cv2.CAP_PROP_EXPOSURE}
+        with mock.patch.object(sm, "camera_platform", return_value="windows"):
+            dongle = sm.CameraControls(0, capture=FakeDirectShow(missing=props))
+            webcam = sm.CameraControls(0, capture=FakeDirectShow(missing=props - {cv2.CAP_PROP_EXPOSURE}))
+        self.assertTrue(dongle.capture_box)
+        self.assertEqual(set(dongle.settings), {"white balance"})
+        self.assertFalse(webcam.capture_box)
 
     def test_the_panel_says_set_it_on_the_camera(self):
         class Nothing:

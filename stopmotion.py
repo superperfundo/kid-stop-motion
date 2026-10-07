@@ -1581,7 +1581,11 @@ class LockableSetting:
         value = self.min + round((value - self.min) / self.step) * self.step
         value = max(self.min, min(self.max, value))
         self.camera.set(self.auto_control, self.auto_off)
-        self.camera.set(self.value_control, value)
+        took = self.camera.set(self.value_control, value)
+        if took is not None:            # cameras that say what they really took (Windows)
+            value = took
+            self.min = self.camera.get(self.value_control, GET_MIN)     # it may have found where its range ends
+            self.max = self.camera.get(self.value_control, GET_MAX)
         self.value, self.locked = value, True
 
     def unlock(self):
@@ -1690,6 +1694,9 @@ class CameraControls:
             return
         units = getattr(self.usb, "units", None)
         no_camera_inside = isinstance(units, dict) and "terminal" not in units    # UVC, but no camera terminal
+        # Through V4L2 and DirectShow, webcams show focus or exposure (or both);
+        # a video device with neither is passing another camera's picture along.
+        no_camera_inside |= getattr(self.usb, "sees_every_control", False)
         if no_camera_inside or looks_like_capture_box(self.name):
             self.capture_box = True
             self.problem = ("This looks like an HDMI capture box, so the app can't reach the camera's own "
@@ -1797,6 +1804,7 @@ class V4L2Camera:
     """A Linux webcam's own controls, answering the same requests as UVCCamera."""
 
     QUERYCTRL = struct.Struct("<II32siiiiI2I")
+    sees_every_control = True
 
     def __init__(self, index, ioctl=None, opener=os.open):
         if ioctl is None:
@@ -1866,21 +1874,32 @@ class DirectShowCamera:
     """A Windows webcam's own controls through OpenCV's DirectShow backend,
     answering the same requests as UVCCamera.
 
-    OpenCV can't tell us the ranges, so we start from typical ones; when the
-    camera refuses a value, we find the nearest one it takes and narrow the
-    range to match."""
+    OpenCV can't tell us the ranges, so we start from typical ones. When the
+    camera refuses a value, we look a little further on for one it takes
+    (some only take every fifth, say); if there's none, we've gone past the
+    end of its range, so we find where it ends and remember that. set()
+    says what the camera actually took."""
 
     PROPS = {FOCUS: cv2.CAP_PROP_FOCUS, FOCUS_AUTO: cv2.CAP_PROP_AUTOFOCUS,
              EXPOSURE_TIME: cv2.CAP_PROP_EXPOSURE, AE_MODE: cv2.CAP_PROP_AUTO_EXPOSURE,
              WHITE_BALANCE: cv2.CAP_PROP_WB_TEMPERATURE, WHITE_BALANCE_AUTO: cv2.CAP_PROP_AUTO_WB}
     # DirectShow counts exposure in powers of two of a second (-13 is 1/8192 s);
     # we hand it on in 0.1 ms, like UVC, so locking by matching works the same.
-    RANGES = {FOCUS: (0, 255, 1), EXPOSURE_TIME: (-13, -1, 1), WHITE_BALANCE: (2000, 6500, 10)}
+    # It stops short of -1 (1/2 s), which OpenCV also uses for "no such control".
+    RANGES = {FOCUS: (0, 255, 1), EXPOSURE_TIME: (-13, -2, 1), WHITE_BALANCE: (2000, 6500, 10)}
+    SEARCH = 20          # how many steps on from a refused value to try
+    sees_every_control = True
 
     def __init__(self, capture):
         self.cap = capture
         self.ranges = {control: list(limits) for control, limits in self.RANGES.items()}
         self.exposure_mode = AE_AUTO      # DirectShow can't report this, so we remember it
+        # OpenCV answers -1 for a control the camera hasn't got - and for an
+        # exposure of 1/2 s - so check what it has once, now, while it's on auto.
+        self.has = {control for control, prop in self.PROPS.items()
+                    if control != AE_MODE and capture.get(prop) != -1}
+        if EXPOSURE_TIME in self.has:
+            self.has.add(AE_MODE)         # it can't be read, only set
 
     @staticmethod
     def to_tenths(log2_seconds):
@@ -1890,61 +1909,81 @@ class DirectShowCamera:
     def to_log2(tenths):
         return round(math.log2(max(tenths, 1e-3) / 10000))
 
-    def _read(self, prop):
-        value = self.cap.get(prop)
-        if value == -1:                   # OpenCV's "the camera doesn't have this"
+    def _check(self, control):
+        if control not in self.has:
             raise OSError("not on this camera")
+
+    def _read(self, control):
+        value = self.cap.get(self.PROPS[control])
+        if value == -1 and control != EXPOSURE_TIME:
+            raise OSError("no answer from the camera")
         return value
 
     def get(self, control, request=GET_CUR):
-        if control not in self.PROPS:
-            raise OSError("not on this camera")
+        self._check(control)
         if control == AE_MODE:
-            self._read(cv2.CAP_PROP_EXPOSURE)
             return AE_MANUAL | AE_AUTO if request == GET_RES else self.exposure_mode
-        if control == FOCUS_AUTO:         # DirectShow reports its flags: 1 auto, 2 manual
-            return 1 if self._read(cv2.CAP_PROP_AUTOFOCUS) == 1 else 0
-        if control == WHITE_BALANCE_AUTO:
-            return int(self._read(cv2.CAP_PROP_AUTO_WB))
+        if control in (FOCUS_AUTO, WHITE_BALANCE_AUTO):  # DirectShow's flags: 1 auto, 2 manual
+            return 1 if self._read(control) == 1 else 0
         if request == GET_CUR:
-            value = self._read(self.PROPS[control])
+            value = self._read(control)
             return self.to_tenths(value) if control == EXPOSURE_TIME else value
-        self._read(self.PROPS[control])   # check it has this at all
         low, high, step = self.ranges[control]
         if control == EXPOSURE_TIME:
             return {GET_MIN: self.to_tenths(low), GET_MAX: self.to_tenths(high), GET_RES: 1}[request]
         return {GET_MIN: low, GET_MAX: high, GET_RES: step}[request]
 
     def set(self, control, value):
-        if control not in self.PROPS:
-            raise OSError("not on this camera")
+        """Set a control. Returns the value the camera took (None for auto
+        switches and modes)."""
+        self._check(control)
         prop = self.PROPS[control]
         if control == AE_MODE:
             self._write(prop, 0 if value == AE_MANUAL else 1)
             self.exposure_mode = value
-            return
+            return None
         if control in (FOCUS_AUTO, WHITE_BALANCE_AUTO):
             self._write(prop, 1 if value else 0)
-            return
-        wanted = self.to_log2(value) if control == EXPOSURE_TIME else int(round(value))
-        if self.cap.set(prop, wanted):
-            return
-        # Refused: probably outside this camera's range. Look between where it is
-        # and what we asked for, for the nearest value it takes.
-        good, bad = self.cap.get(prop), wanted
-        if good == -1 or not self.cap.set(prop, good):
-            raise OSError("the camera wouldn't take that")
-        for _ in range(16):
-            if abs(bad - good) <= 1:
-                break
-            middle = int(round((good + bad) / 2))
-            if self.cap.set(prop, middle):
-                good = middle
-            else:
-                bad = middle
-        self.cap.set(prop, good)
+            return None
         limits = self.ranges[control]
-        limits[1 if wanted > good else 0] = good      # that end of the range, now we know it
+        wanted = self.to_log2(value) if control == EXPOSURE_TIME else int(round(value))
+        wanted = max(limits[0], min(limits[1], wanted))
+        took = self._set_nearest(control, wanted, limits)
+        return self.to_tenths(took) if control == EXPOSURE_TIME else took
+
+    def _set_nearest(self, control, wanted, limits):
+        prop, step = self.PROPS[control], limits[2]
+
+        def take(value, toward, stop=None):
+            """Set `value`, or the first value after it (going `toward`) the
+            camera takes, short of `stop`. Returns what it took, or None."""
+            for n in range(self.SEARCH):
+                candidate = value + toward * n * step
+                if not limits[0] <= candidate <= limits[1] or (stop is not None and (candidate - stop) * toward >= 0):
+                    break
+                if self.cap.set(prop, candidate):
+                    return candidate
+            return None
+
+        start = int(round(self._read(control)))
+        direction = 1 if wanted >= start else -1
+        took = take(wanted, direction)
+        if took is not None:
+            return took
+        # Nothing from there on: we've gone past the end of its range. Find the
+        # end, between where it was and what we asked for.
+        good, bad = start, wanted
+        while abs(bad - good) > step:
+            # Halfway back, in whole steps from what we asked for (values off its steps get refused anyway).
+            middle = bad - direction * max(1, abs(bad - good) // step // 2) * step
+            found = take(middle, direction, stop=bad)
+            if found is None:
+                bad = middle          # nothing from here on: past the end
+            else:
+                good = found
+        self._write(prop, good)
+        limits[1 if direction > 0 else 0] = good      # that end of the range, now we know it
+        return good
 
     def _write(self, prop, value):
         if not self.cap.set(prop, value):
@@ -2250,7 +2289,14 @@ class CameraSetup:
             self.matches["exposure"].target += step * EXPOSURE_STEP * math.log(2)
             return "Locking exposure..."
         if exposure.locked:
-            problem = self.controls.set_value("exposure", exposure.value * 2 ** (step * EXPOSURE_STEP))
+            before, wanted = exposure.value, exposure.value
+            for _ in range(max(1, round(1 / EXPOSURE_STEP))):
+                # A camera that only has whole stops (Windows) stays put for a
+                # third of one, so keep going until it moves - a stop at most.
+                wanted *= 2 ** (step * EXPOSURE_STEP)
+                problem = self.controls.set_value("exposure", wanted)
+                if problem or exposure.value != before:
+                    break
             return problem or f"Exposure LOCKED at {exposure.format(exposure.value)}"
         if self.camera_frame is None:
             return "The camera isn't ready yet."
@@ -2283,36 +2329,70 @@ class CameraSetup:
 
 # -------------------------------------------------------------------- camera
 
-def choose_camera_size(cap):
+def choose_camera_size(cap, clock=time.monotonic):
     """Ask for the sharpest picture the camera really sends (up to
-    CAMERA_MAX_SIZE) at a usable frame rate. False if no picture comes at all.
+    CAMERA_MAX_SIZE) at MIN_CAMERA_FPS or more. False if no picture comes at all.
 
-    Cameras answer a size they can't do in different ways - the nearest size,
-    their own default, or nothing - so each size is checked with a real picture."""
-    if camera_platform() in ("windows", "linux"):
-        # Big pictures only fit down a USB cable compressed.
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    ok, frame = cap.read()                # what it sends on its own, to fall back on
-    best = (frame.shape[1], frame.shape[0]) if ok and frame is not None else None
-    for w, h in CAMERA_SIZES:
-        if w > CAMERA_MAX_SIZE[0] or h > CAMERA_MAX_SIZE[1]:
-            continue
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        ok, frame = cap.read()
+    Cameras answer a size they haven't got in different ways (moving to the
+    nearest size, staying as they are, or stopping), and what they report
+    about their frame rate can't be trusted, so each size is checked by
+    timing real pictures."""
+    platform = camera_platform()
+    mjpg = cv2.VideoWriter_fourcc(*"MJPG")
+    if platform == "linux":
+        cap.set(cv2.CAP_PROP_FOURCC, mjpg)        # big pictures only fit down a USB cable compressed
+    elif platform == "windows":
+        cap.set(cv2.CAP_PROP_FPS, 30)             # DirectShow uses this for every size it sets up
+
+    def measure():
+        """(size, pictures a second) from real pictures, or None."""
+        ok, frame = cap.read()                    # the first after a change can be late: don't time it
         if not ok or frame is None:
+            return None
+        began = clock()
+        for _ in range(3):
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                return None
+        elapsed = clock() - began
+        return (frame.shape[1], frame.shape[0]), (3 / elapsed if elapsed > 0 else float("inf"))
+
+    def ask(size):
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
+        if platform == "windows":
+            cap.set(cv2.CAP_PROP_FOURCC, mjpg)    # DirectShow applies it to the size just set
+        elif platform == "linux":
+            cap.set(cv2.CAP_PROP_FPS, 30)         # or V4L2 keeps a slow rate from the last size
+        return measure()
+
+    def area(size):
+        return size[0] * size[1]
+
+    current = measure()                           # what it sends by itself
+    seen = dict([current]) if current else {}     # every size it has sent -> pictures a second
+    ceiling = None
+    for size in CAMERA_SIZES:
+        if size[0] > CAMERA_MAX_SIZE[0] or size[1] > CAMERA_MAX_SIZE[1] or (ceiling and area(size) > ceiling):
             continue
-        got = (frame.shape[1], frame.shape[0])
-        fps = cap.get(cv2.CAP_PROP_FPS) or 0
-        if got == (w, h) and (fps <= 0 or fps >= MIN_CAMERA_FPS):
+        if current is None or current[0] != size:  # (if it's already sending this size, no need to ask)
+            before = current[0] if current else None
+            current = ask(size)
+            if current is None:
+                continue
+            seen[current[0]] = current[1]
+            if current[0] != before and area(current[0]) < area(size):
+                # It moved to the nearest size it has, so it has nothing bigger than that.
+                ceiling = min(ceiling or area(current[0]), area(current[0]))
+        if current[0] == size and current[1] >= MIN_CAMERA_FPS:
             return True
-        if best is None or got[0] * got[1] > best[0] * best[1]:
-            best = got
-    if best is not None:            # no exact match: go back to the biggest it sent (or its own)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, best[0])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, best[1])
-    ok, frame = cap.read()
-    return bool(ok) and frame is not None
+    # Nothing exact and quick enough: the biggest size it sent quickly enough, else the biggest at all.
+    allowed = [size for size in seen if area(size) <= area(CAMERA_MAX_SIZE)] or list(seen)
+    quick = [size for size in allowed if seen[size] >= MIN_CAMERA_FPS]
+    if not allowed:
+        return False
+    pick = max(quick or allowed, key=area)
+    return (current is not None and current[0] == pick) or ask(pick) is not None
 
 
 def capture_backend(cap):
@@ -2360,12 +2440,16 @@ class Camera:
         self.generation += 1
         return self.cap is not None
 
-    def switch(self):
-        """Move to the next camera, wrapping round to the first. False if there's no other one."""
+    def switch(self, on_change=None):
+        """Move to the next camera, wrapping round to the first. False if
+        there's no other one. `on_change` runs just before the old camera is
+        let go (to put its settings back to auto while they can still be reached)."""
         for candidate in (self.index + 1, 0):
             if candidate != self.index:
                 cap = self._open(candidate)
                 if cap is not None:
+                    if on_change is not None:
+                        on_change()
                     self.release()
                     self.index, self.cap, self.failures = candidate, cap, 0
                     self.generation += 1
@@ -3563,7 +3647,7 @@ class App:
             self.camera_panel = False
             self.slider_drag = None
         elif action == "switch":
-            if self.camera.switch():
+            if self.camera.switch(on_change=cam.close):
                 cam.sync(self.camera)
                 summary = cam.controls.summary() if cam.controls else ""
                 self.toast(f"Camera {self.camera.index + 1}: {cam.name} ({summary})")
