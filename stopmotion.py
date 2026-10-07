@@ -32,6 +32,7 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -60,7 +61,10 @@ ROTATE_180 = False
 FPS = 12
 
 CAMERA_INDEX = 0             # which camera to start with (0 = the first); K then C switches
-CAMERA_SIZE = (1280, 720)    # the resolution we ask the webcam for
+
+# The sharpest picture to ask the camera for. Cameras that can't manage it give
+# their best below it. Set (1920, 1080) for smaller files and a snappier studio.
+CAMERA_MAX_SIZE = (3840, 2160)
 
 # Each press of - or + in the camera panel changes exposure by this many stops.
 # On cameras we can't control, the app brightens the picture itself, up to 2 stops.
@@ -89,6 +93,8 @@ BACKUPS_DIR = "backups"
 TRASH_DIR = "trash"
 LOCK_FILE = ".in-use"
 SETTINGS_FILE = ".settings.json"     # in the projects folder: which cameras are upside down
+CAMERA_SIZES = [(3840, 2160), (2560, 1440), (1920, 1080), (1280, 720)]   # tried biggest first
+MIN_CAMERA_FPS = 10          # a size the camera can only send slower than this is skipped
 FRAME_EXT = ".jpg"
 JPEG_QUALITY = 95
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
@@ -127,6 +133,15 @@ TITLE_STYLES = [
 
 
 # ------------------------------------------------------------------- helpers
+
+def camera_platform():
+    """"mac", "windows" or "linux" (or whatever else), for how to talk to cameras."""
+    if sys.platform == "darwin":
+        return "mac"
+    if os.name == "nt":
+        return "windows"
+    return "linux" if sys.platform.startswith("linux") else sys.platform
+
 
 def has_ffmpeg():
     return shutil.which("ffmpeg") is not None
@@ -855,17 +870,30 @@ def missing_picture(size):
 
 
 class Renderer:
-    """Turns timeline items into full-size pictures, with a small cache."""
+    """Turns timeline items into pictures, with a cache.
 
-    def __init__(self, project, size=None, cache_size=48):
+    By default pictures come out at the movie's size. `fit_within` makes them
+    no bigger than that (the studio shows 4K movies at screen size), and the
+    cache holds at most CACHE_BYTES of pictures, however big they are."""
+
+    CACHE_BYTES = 400 * 1024 * 1024
+
+    def __init__(self, project, size=None, fit_within=None):
         self.project = project
         self.fixed_size = tuple(size) if size else None
+        self.fit_within = tuple(fit_within) if fit_within else None
         self.cache = OrderedDict()
-        self.cache_size = cache_size
+        self.cached_bytes = 0
 
     @property
     def size(self):
-        return self.fixed_size or self.project.size
+        if self.fixed_size:
+            return self.fixed_size
+        w, h = self.project.size
+        if self.fit_within:
+            scale = min(1.0, self.fit_within[0] / w, self.fit_within[1] / h)
+            return even_size(w * scale, h * scale)
+        return w, h
 
     def image(self, item):
         key = (item_key(item), self.size)
@@ -873,8 +901,9 @@ class Renderer:
         if img is None:
             img = self._make(item)
             self.cache[key] = img
-            if len(self.cache) > self.cache_size:
-                self.cache.popitem(last=False)
+            self.cached_bytes += img.nbytes
+            while self.cached_bytes > self.CACHE_BYTES and len(self.cache) > 1:
+                self.cached_bytes -= self.cache.popitem(last=False)[1].nbytes
         else:
             self.cache.move_to_end(key)
         return img
@@ -882,7 +911,17 @@ class Renderer:
     def _make(self, item):
         if item["kind"] == "title":
             return render_title(item, self.size)
-        img = cv2.imread(str(self.project.file_path(item["file"])))
+        # Pictures are the movie's size, so when we want them much smaller, let
+        # the JPEG decoder skip the detail (a lot quicker for 4K pictures).
+        w, h = self.size
+        mw, mh = self.project.size
+        flag = cv2.IMREAD_COLOR
+        for factor, reduced in ((8, cv2.IMREAD_REDUCED_COLOR_8), (4, cv2.IMREAD_REDUCED_COLOR_4),
+                                (2, cv2.IMREAD_REDUCED_COLOR_2)):
+            if mw // factor >= w and mh // factor >= h:
+                flag = reduced
+                break
+        img = cv2.imread(str(self.project.file_path(item["file"])), flag)
         if img is None:
             return missing_picture(self.size)
         return fit_image(img, self.size)
@@ -1542,7 +1581,11 @@ class LockableSetting:
         value = self.min + round((value - self.min) / self.step) * self.step
         value = max(self.min, min(self.max, value))
         self.camera.set(self.auto_control, self.auto_off)
-        self.camera.set(self.value_control, value)
+        took = self.camera.set(self.value_control, value)
+        if took is not None:            # cameras that say what they really took (Windows)
+            value = took
+            self.min = self.camera.get(self.value_control, GET_MIN)     # it may have found where its range ends
+            self.max = self.camera.get(self.value_control, GET_MAX)
         self.value, self.locked = value, True
 
     def unlock(self):
@@ -1568,51 +1611,97 @@ class LockableSetting:
 class CameraControls:
     """Focus, exposure and white balance for the camera OpenCV opened at `index`."""
 
-    def __init__(self, index, usb=None, name=None):
+    def __init__(self, index, usb=None, name=None, capture=None):
         self.name = name or f"Camera {index + 1}"
         self.usb = usb        # tests hand in a pretend camera here
         self.settings = {}  # "focus" / "exposure" / "white balance" -> LockableSetting
         self.problem = None   # why there are no controls, if we know
+        self.capture_box = False
 
         if usb is None:
-            if sys.platform != "darwin":
-                self.problem = "These controls only work on a Mac for now."
-                return
-            try:
-                info = mac_camera_info(index)
-            except (OSError, ValueError, AttributeError):   # AttributeError: a camera with no name
-                info = None
-            if info is None:
-                return
-            self.name, unique_id = info
-            # A USB camera's ID is a hex number: its USB location, then vendor and
-            # product IDs, e.g. 0x124000046d08e5. Other cameras have other IDs.
-            try:
-                usb_id = int(unique_id, 16) if unique_id.startswith("0x") else 0
-            except ValueError:
-                usb_id = 0
-            if usb_id >> 32 == 0:
-                self.problem = "It isn't a USB webcam (built-in cameras aren't)."
-                return
-            try:
-                self.usb = UVCCamera(usb_id >> 16 & 0xFFFF, usb_id & 0xFFFF, usb_id >> 32)
-            except OSError as err:
-                print(f"No focus, exposure or white balance controls for {self.name}: {err}")
-                self.problem = f"Couldn't reach its controls: {err}"
-                return
+            self.usb = self._find_device(index, capture)
+            if name:
+                self.name = name
 
-        makers = {
-            "focus": lambda: LockableSetting(self.usb, FOCUS, FOCUS_AUTO, 1, 0),
-            "exposure": self._exposure,
-            "white balance": lambda: LockableSetting(self.usb, WHITE_BALANCE, WHITE_BALANCE_AUTO, 1, 0,
-                                                     format=lambda v: f"{v}K"),
-        }
-        for name, make in makers.items():
+        if self.usb is not None:
+            makers = {
+                "focus": lambda: LockableSetting(self.usb, FOCUS, FOCUS_AUTO, 1, 0),
+                "exposure": self._exposure,
+                "white balance": lambda: LockableSetting(self.usb, WHITE_BALANCE, WHITE_BALANCE_AUTO, 1, 0,
+                                                         format=lambda v: f"{v:g}K"),
+            }
+            for name, make in makers.items():
+                try:
+                    self.settings[name] = make()
+                    self.settings[name].unlock()  # start on auto
+                except OSError:
+                    self.settings.pop(name, None)  # this camera doesn't have it
+        self._check_capture_box()
+
+    def _find_device(self, index, capture):
+        """The camera's own controls on this computer, or None (and self.problem says why).
+        Every kind answers the same requests as UVCCamera."""
+        platform = camera_platform()
+        if platform == "linux":
             try:
-                self.settings[name] = make()
-                self.settings[name].unlock()  # start on auto
-            except OSError:
-                self.settings.pop(name, None)  # this camera doesn't have it
+                device = V4L2Camera(index)
+            except FileNotFoundError:
+                self.problem = f"Couldn't find it at /dev/video{index}."
+                return None
+            except PermissionError:
+                self.problem = "No permission to change its settings (try adding yourself to the 'video' group)."
+                return None
+            except OSError as err:
+                self.problem = f"Couldn't reach its controls: {err}"
+                return None
+            self.name = device.name or self.name
+            return device
+        if platform == "windows":
+            if capture is not None and capture_backend(capture) == "DSHOW":
+                return DirectShowCamera(capture)
+            self.problem = "Windows only lets the app reach a camera's settings when it opens through DirectShow."
+            return None
+        if platform != "mac":
+            self.problem = "These controls aren't available on this computer yet."
+            return None
+        try:
+            info = mac_camera_info(index)
+        except (OSError, ValueError, AttributeError):   # AttributeError: a camera with no name
+            info = None
+        if info is None:
+            return None
+        self.name, unique_id = info
+        # A USB camera's ID is a hex number: its USB location, then vendor and
+        # product IDs, e.g. 0x124000046d08e5. Other cameras have other IDs.
+        try:
+            usb_id = int(unique_id, 16) if unique_id.startswith("0x") else 0
+        except ValueError:
+            usb_id = 0
+        if usb_id >> 32 == 0:
+            self.problem = "It isn't a USB webcam (built-in cameras aren't)."
+            return None
+        try:
+            return UVCCamera(usb_id >> 16 & 0xFFFF, usb_id & 0xFFFF, usb_id >> 32)
+        except OSError as err:
+            print(f"No focus, exposure or white balance controls for {self.name}: {err}")
+            self.problem = f"Couldn't reach its controls: {err}"
+            return None
+
+    def _check_capture_box(self):
+        """An HDMI capture box passes the camera's picture along, but not its
+        settings: those have to be set on the camera itself."""
+        if "focus" in self.settings or "exposure" in self.settings:
+            return
+        units = getattr(self.usb, "units", None)
+        no_camera_inside = isinstance(units, dict) and "terminal" not in units    # UVC, but no camera terminal
+        # Through V4L2 and DirectShow, webcams show focus or exposure (or both);
+        # a video device with neither is passing another camera's picture along.
+        no_camera_inside |= getattr(self.usb, "sees_every_control", False)
+        if no_camera_inside or looks_like_capture_box(self.name):
+            self.capture_box = True
+            self.problem = ("This looks like an HDMI capture box, so the app can't reach the camera's own "
+                            "settings. Set focus, exposure and white balance on the camera itself - manual "
+                            "settings are best, so the movie doesn't flicker.")
 
     def _exposure(self):
         current = self.usb.get(AE_MODE)
@@ -1683,6 +1772,225 @@ class CameraControls:
         if self.usb:
             self.usb.close()
             self.usb = None
+
+
+CAPTURE_BOX_WORDS = ("cam link", "capture", "hdmi", "live gamer", "game ", "avermedia", "elgato hd",
+                     "mirabox", "ezcap", "usb video", "video grabber", "magewell", "ultrastudio", "atomos")
+
+
+def looks_like_capture_box(name):
+    name = f" {name or ''} ".lower()
+    return any(word in name for word in CAPTURE_BOX_WORDS)
+
+
+# Linux: the kernel's video interface (V4L2) has the same controls, and unlike
+# OpenCV it can tell us each camera's real ranges. Sizes are from videodev2.h.
+VIDIOC_QUERYCAP = 0x80685600      # struct v4l2_capability, 104 bytes
+VIDIOC_G_CTRL = 0xC008561B        # struct v4l2_control, 8 bytes
+VIDIOC_S_CTRL = 0xC008561C
+VIDIOC_QUERYCTRL = 0xC0445624     # struct v4l2_queryctrl, 68 bytes
+VIDIOC_QUERYMENU = 0xC02C5625     # struct v4l2_querymenu, 44 bytes
+V4L2_CTRL_FLAG_DISABLED = 0x0001
+V4L2_CONTROLS = {                 # our (UVC) controls -> V4L2 control IDs
+    FOCUS: 0x009A090A, FOCUS_AUTO: 0x009A090C,
+    EXPOSURE_TIME: 0x009A0902,    # also 0.1 ms units, like UVC
+    AE_MODE: 0x009A0901,
+    WHITE_BALANCE: 0x0098091A, WHITE_BALANCE_AUTO: 0x0098090C,
+}
+V4L2_AE_MODES = {0: AE_AUTO, 1: AE_MANUAL, 2: 4, 3: AE_APERTURE_PRIORITY}   # menu entry -> UVC mode bit
+
+
+class V4L2Camera:
+    """A Linux webcam's own controls, answering the same requests as UVCCamera."""
+
+    QUERYCTRL = struct.Struct("<II32siiiiI2I")
+    sees_every_control = True
+
+    def __init__(self, index, ioctl=None, opener=os.open):
+        if ioctl is None:
+            import fcntl
+            ioctl = fcntl.ioctl
+        self._ioctl = ioctl
+        self.fd = opener(f"/dev/video{index}", os.O_RDWR | os.O_NONBLOCK)
+        self.name = None
+        try:
+            info = bytearray(104)
+            self._ioctl(self.fd, VIDIOC_QUERYCAP, info)
+            self.name = bytes(info[16:48]).split(b"\0")[0].decode("utf-8", "replace").strip() or None
+        except OSError:
+            pass
+
+    def _cid(self, control):
+        if control not in V4L2_CONTROLS:
+            raise OSError("not on this camera")
+        return V4L2_CONTROLS[control]
+
+    def _range(self, cid):
+        buf = bytearray(self.QUERYCTRL.pack(cid, 0, b"", 0, 0, 0, 0, 0, 0, 0))
+        self._ioctl(self.fd, VIDIOC_QUERYCTRL, buf)
+        _, _, _, low, high, step, _, flags, _, _ = self.QUERYCTRL.unpack(buf)
+        if flags & V4L2_CTRL_FLAG_DISABLED:
+            raise OSError("not on this camera")
+        return low, high, step
+
+    def _menu_has(self, cid, entry):
+        try:
+            self._ioctl(self.fd, VIDIOC_QUERYMENU, bytearray(struct.pack("<II32sI", cid, entry, b"", 0)))
+            return True
+        except OSError:
+            return False
+
+    def _value(self, cid):
+        buf = bytearray(struct.pack("<Ii", cid, 0))
+        self._ioctl(self.fd, VIDIOC_G_CTRL, buf)
+        return struct.unpack("<Ii", buf)[1]
+
+    def get(self, control, request=GET_CUR):
+        cid = self._cid(control)
+        if control == AE_MODE:
+            if request == GET_RES:                # which modes it has, as UVC's bitmap
+                low, high, _ = self._range(cid)
+                return sum(bit for entry, bit in V4L2_AE_MODES.items()
+                           if low <= entry <= high and self._menu_has(cid, entry))
+            return V4L2_AE_MODES.get(self._value(cid), AE_AUTO)
+        if request == GET_CUR:
+            return self._value(cid)
+        low, high, step = self._range(cid)
+        return {GET_MIN: low, GET_MAX: high, GET_RES: step}[request]
+
+    def set(self, control, value):
+        cid = self._cid(control)
+        if control == AE_MODE:
+            value = {bit: entry for entry, bit in V4L2_AE_MODES.items()}.get(int(value), 0)
+        self._ioctl(self.fd, VIDIOC_S_CTRL, bytearray(struct.pack("<Ii", cid, int(round(value)))))
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+class DirectShowCamera:
+    """A Windows webcam's own controls through OpenCV's DirectShow backend,
+    answering the same requests as UVCCamera.
+
+    OpenCV can't tell us the ranges, so we start from typical ones. When the
+    camera refuses a value, we look a little further on for one it takes
+    (some only take every fifth, say); if there's none, we've gone past the
+    end of its range, so we find where it ends and remember that. set()
+    says what the camera actually took."""
+
+    PROPS = {FOCUS: cv2.CAP_PROP_FOCUS, FOCUS_AUTO: cv2.CAP_PROP_AUTOFOCUS,
+             EXPOSURE_TIME: cv2.CAP_PROP_EXPOSURE, AE_MODE: cv2.CAP_PROP_AUTO_EXPOSURE,
+             WHITE_BALANCE: cv2.CAP_PROP_WB_TEMPERATURE, WHITE_BALANCE_AUTO: cv2.CAP_PROP_AUTO_WB}
+    # DirectShow counts exposure in powers of two of a second (-13 is 1/8192 s);
+    # we hand it on in 0.1 ms, like UVC, so locking by matching works the same.
+    # It stops short of -1 (1/2 s), which OpenCV also uses for "no such control".
+    RANGES = {FOCUS: (0, 255, 1), EXPOSURE_TIME: (-13, -2, 1), WHITE_BALANCE: (2000, 6500, 10)}
+    SEARCH = 20          # how many steps on from a refused value to try
+    sees_every_control = True
+
+    def __init__(self, capture):
+        self.cap = capture
+        self.ranges = {control: list(limits) for control, limits in self.RANGES.items()}
+        self.exposure_mode = AE_AUTO      # DirectShow can't report this, so we remember it
+        # OpenCV answers -1 for a control the camera hasn't got - and for an
+        # exposure of 1/2 s - so check what it has once, now, while it's on auto.
+        self.has = {control for control, prop in self.PROPS.items()
+                    if control != AE_MODE and capture.get(prop) != -1}
+        if EXPOSURE_TIME in self.has:
+            self.has.add(AE_MODE)         # it can't be read, only set
+
+    @staticmethod
+    def to_tenths(log2_seconds):
+        return 10000 * 2 ** log2_seconds
+
+    @staticmethod
+    def to_log2(tenths):
+        return round(math.log2(max(tenths, 1e-3) / 10000))
+
+    def _check(self, control):
+        if control not in self.has:
+            raise OSError("not on this camera")
+
+    def _read(self, control):
+        value = self.cap.get(self.PROPS[control])
+        if value == -1 and control != EXPOSURE_TIME:
+            raise OSError("no answer from the camera")
+        return value
+
+    def get(self, control, request=GET_CUR):
+        self._check(control)
+        if control == AE_MODE:
+            return AE_MANUAL | AE_AUTO if request == GET_RES else self.exposure_mode
+        if control in (FOCUS_AUTO, WHITE_BALANCE_AUTO):  # DirectShow's flags: 1 auto, 2 manual
+            return 1 if self._read(control) == 1 else 0
+        if request == GET_CUR:
+            value = self._read(control)
+            return self.to_tenths(value) if control == EXPOSURE_TIME else value
+        low, high, step = self.ranges[control]
+        if control == EXPOSURE_TIME:
+            return {GET_MIN: self.to_tenths(low), GET_MAX: self.to_tenths(high), GET_RES: 1}[request]
+        return {GET_MIN: low, GET_MAX: high, GET_RES: step}[request]
+
+    def set(self, control, value):
+        """Set a control. Returns the value the camera took (None for auto
+        switches and modes)."""
+        self._check(control)
+        prop = self.PROPS[control]
+        if control == AE_MODE:
+            self._write(prop, 0 if value == AE_MANUAL else 1)
+            self.exposure_mode = value
+            return None
+        if control in (FOCUS_AUTO, WHITE_BALANCE_AUTO):
+            self._write(prop, 1 if value else 0)
+            return None
+        limits = self.ranges[control]
+        wanted = self.to_log2(value) if control == EXPOSURE_TIME else int(round(value))
+        wanted = max(limits[0], min(limits[1], wanted))
+        took = self._set_nearest(control, wanted, limits)
+        return self.to_tenths(took) if control == EXPOSURE_TIME else took
+
+    def _set_nearest(self, control, wanted, limits):
+        prop, step = self.PROPS[control], limits[2]
+
+        def take(value, toward, stop=None):
+            """Set `value`, or the first value after it (going `toward`) the
+            camera takes, short of `stop`. Returns what it took, or None."""
+            for n in range(self.SEARCH):
+                candidate = value + toward * n * step
+                if not limits[0] <= candidate <= limits[1] or (stop is not None and (candidate - stop) * toward >= 0):
+                    break
+                if self.cap.set(prop, candidate):
+                    return candidate
+            return None
+
+        start = int(round(self._read(control)))
+        direction = 1 if wanted >= start else -1
+        took = take(wanted, direction)
+        if took is not None:
+            return took
+        # Nothing from there on: we've gone past the end of its range. Find the
+        # end, between where it was and what we asked for.
+        good, bad = start, wanted
+        while abs(bad - good) > step:
+            # Halfway back, in whole steps from what we asked for (values off its steps get refused anyway).
+            middle = bad - direction * max(1, abs(bad - good) // step // 2) * step
+            found = take(middle, direction, stop=bad)
+            if found is None:
+                bad = middle          # nothing from here on: past the end
+            else:
+                good = found
+        self._write(prop, good)
+        limits[1 if direction > 0 else 0] = good      # that end of the range, now we know it
+        return good
+
+    def _write(self, prop, value):
+        if not self.cap.set(prop, value):
+            raise OSError("the camera wouldn't take that")
+
+    def close(self):
+        self.cap = None                   # the picture still needs the camera: don't release it
 
 
 def linear_light(frame):
@@ -1862,8 +2170,8 @@ class CameraSetup:
         except (OSError, ValueError, AttributeError):
             self.flips = {}
 
-    def make_controls(self, index):
-        return CameraControls(index)
+    def make_controls(self, camera):
+        return CameraControls(camera.index, capture=camera.cap)
 
     def sync(self, camera):
         """Set up the controls for the camera we have now (it may have been
@@ -1878,7 +2186,7 @@ class CameraSetup:
         self.generation, self.index = camera.generation, camera.index
         if not camera.ok:
             return
-        self.controls = self.make_controls(camera.index)
+        self.controls = self.make_controls(camera)
         print(f"Camera {camera.index + 1}: {self.controls.name} ({self.controls.summary()})")
         if same and self.controls.name == name and (kept or brightness):
             for key, value in kept.items():
@@ -1981,7 +2289,14 @@ class CameraSetup:
             self.matches["exposure"].target += step * EXPOSURE_STEP * math.log(2)
             return "Locking exposure..."
         if exposure.locked:
-            problem = self.controls.set_value("exposure", exposure.value * 2 ** (step * EXPOSURE_STEP))
+            before, wanted = exposure.value, exposure.value
+            for _ in range(max(1, round(1 / EXPOSURE_STEP))):
+                # A camera that only has whole stops (Windows) stays put for a
+                # third of one, so keep going until it moves - a stop at most.
+                wanted *= 2 ** (step * EXPOSURE_STEP)
+                problem = self.controls.set_value("exposure", wanted)
+                if problem or exposure.value != before:
+                    break
             return problem or f"Exposure LOCKED at {exposure.format(exposure.value)}"
         if self.camera_frame is None:
             return "The camera isn't ready yet."
@@ -2014,6 +2329,81 @@ class CameraSetup:
 
 # -------------------------------------------------------------------- camera
 
+def choose_camera_size(cap, clock=time.monotonic):
+    """Ask for the sharpest picture the camera really sends (up to
+    CAMERA_MAX_SIZE) at MIN_CAMERA_FPS or more. False if no picture comes at all.
+
+    Cameras answer a size they haven't got in different ways (moving to the
+    nearest size, staying as they are, or stopping), and what they report
+    about their frame rate can't be trusted, so each size is checked by
+    timing real pictures."""
+    platform = camera_platform()
+    mjpg = cv2.VideoWriter_fourcc(*"MJPG")
+    if platform == "linux":
+        cap.set(cv2.CAP_PROP_FOURCC, mjpg)        # big pictures only fit down a USB cable compressed
+    elif platform == "windows":
+        cap.set(cv2.CAP_PROP_FPS, 30)             # DirectShow uses this for every size it sets up
+
+    def measure():
+        """(size, pictures a second) from real pictures, or None."""
+        ok, frame = cap.read()                    # the first after a change can be late: don't time it
+        if not ok or frame is None:
+            return None
+        began = clock()
+        for _ in range(3):
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                return None
+        elapsed = clock() - began
+        return (frame.shape[1], frame.shape[0]), (3 / elapsed if elapsed > 0 else float("inf"))
+
+    def ask(size):
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
+        if platform == "windows":
+            cap.set(cv2.CAP_PROP_FOURCC, mjpg)    # DirectShow applies it to the size just set
+        elif platform == "linux":
+            cap.set(cv2.CAP_PROP_FPS, 30)         # or V4L2 keeps a slow rate from the last size
+        return measure()
+
+    def area(size):
+        return size[0] * size[1]
+
+    current = measure()                           # what it sends by itself
+    seen = dict([current]) if current else {}     # every size it has sent -> pictures a second
+    ceiling = None
+    for size in CAMERA_SIZES:
+        if size[0] > CAMERA_MAX_SIZE[0] or size[1] > CAMERA_MAX_SIZE[1] or (ceiling and area(size) > ceiling):
+            continue
+        if current is None or current[0] != size:  # (if it's already sending this size, no need to ask)
+            before = current[0] if current else None
+            current = ask(size)
+            if current is None:
+                continue
+            seen[current[0]] = current[1]
+            if current[0] != before and area(current[0]) < area(size):
+                # It moved to the nearest size it has, so it has nothing bigger than that.
+                ceiling = min(ceiling or area(current[0]), area(current[0]))
+        if current[0] == size and current[1] >= MIN_CAMERA_FPS:
+            return True
+    # Nothing exact and quick enough: the biggest size it sent quickly enough, else the biggest at all.
+    allowed = [size for size in seen if area(size) <= area(CAMERA_MAX_SIZE)] or list(seen)
+    quick = [size for size in allowed if seen[size] >= MIN_CAMERA_FPS]
+    if not allowed:
+        return False
+    pick = max(quick or allowed, key=area)
+    return (current is not None and current[0] == pick) or ask(pick) is not None
+
+
+def capture_backend(cap):
+    """Which part of OpenCV is talking to the camera ("DSHOW", "V4L2", ...)."""
+    try:
+        return cap.getBackendName()
+    except (cv2.error, AttributeError):
+        return ""
+
+
+
 class Camera:
     """The webcam. If it drops out (unplugged, settings changed, another app
     grabbed it) the studio keeps going and quietly reconnects."""
@@ -2032,14 +2422,15 @@ class Camera:
         self._guard = threading.Lock()
 
     def _open(self, index=None):
-        """Open a camera and check it delivers a picture; None if it doesn't."""
-        cap = cv2.VideoCapture(self.index if index is None else index)
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_SIZE[0])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_SIZE[1])
-            if cap.read()[0]:
+        """Open a camera at its best size and check it delivers a picture; None if it doesn't."""
+        index = self.index if index is None else index
+        # On Windows, DirectShow lets the app reach focus, exposure and white
+        # balance; Windows' newer default doesn't fully. Fall back to it if need be.
+        for api in ([cv2.CAP_DSHOW, None] if camera_platform() == "windows" else [None]):
+            cap = cv2.VideoCapture(index) if api is None else cv2.VideoCapture(index, api)
+            if cap.isOpened() and choose_camera_size(cap):
                 return cap
-        cap.release()
+            cap.release()
         return None
 
     def start(self):
@@ -2049,12 +2440,16 @@ class Camera:
         self.generation += 1
         return self.cap is not None
 
-    def switch(self):
-        """Move to the next camera, wrapping round to the first. False if there's no other one."""
+    def switch(self, on_change=None):
+        """Move to the next camera, wrapping round to the first. False if
+        there's no other one. `on_change` runs just before the old camera is
+        let go (to put its settings back to auto while they can still be reached)."""
         for candidate in (self.index + 1, 0):
             if candidate != self.index:
                 cap = self._open(candidate)
                 if cap is not None:
+                    if on_change is not None:
+                        on_change()
                     self.release()
                     self.index, self.cap, self.failures = candidate, cap, 0
                     self.generation += 1
@@ -2649,7 +3044,7 @@ class App:
                     pass
             self.project.unlock()
         self.project = project
-        self.renderer = Renderer(project)
+        self.renderer = Renderer(project, fit_within=(VIEW_W, VIEW_H))
         self.cursor = None
         self.insert_at = len(project.items)
         self.onion = bool(project.doc.get("onion_skin", True))
@@ -3117,7 +3512,8 @@ class App:
             setting = cam.settings.get(name)
             put_text(c, CameraSetup.NAMES[name], (x0 + 2, y + 16), 0.56, WHITE, 1, UI_BOLD)
             color = {"locked": C_YELLOW, "locking": C_YELLOW, "auto": C_TEXT}.get(state, C_DIM)
-            put_text(c, fit_text(words, 120, 0.42), (x1, y + 16), 0.42, color, 1, align="right")
+            if not (state == "n/a" and cam.controls is not None and cam.controls.capture_box):
+                put_text(c, fit_text(words, 120, 0.42), (x1, y + 16), 0.42, color, 1, align="right")
             row = y + 26
             if setting is not None:
                 locked = state in ("locked", "locking")
@@ -3126,17 +3522,20 @@ class App:
                 fraction = setting.to_slider(setting.value) / 100
                 self.draw_slider(c, name, x0 + 10, x1 - 10, row + 56, fraction, locked)
             else:
-                put_text(c, "not on this camera", (x0 + 2, row + 22), 0.42, C_DIM)
+                capture_box = cam.controls is not None and cam.controls.capture_box
+                put_text(c, "set it on the camera" if capture_box else "not on this camera", (x0 + 2, row + 22),
+                         0.42, C_YELLOW if capture_box else C_DIM)
             if nudge and (setting is not None or name == "exposure"):
                 for k, symbol in enumerate(nudge):
                     bx = x1 - 94 + k * 50
                     self.draw_button(c, (bx, row, bx + 44, row + 34), symbol, action=("camera", symbol),
                                      align="center", scale=0.6)
-            y += 122
+            y += 122 if setting is not None else 70      # rows without a slider are shorter
         problem = self.cam_setup.controls.problem if self.cam_setup.controls else None
         if problem and not cam.settings:
-            for k, line in enumerate(wrap_text(problem, x1 - x0, 0.42, UI_FONT)[:2]):
-                put_text(c, line, (x0 + 2, y + 4 + k * 18), 0.42, C_DIM)
+            room = (VIEW_Y + VIEW_H - 60 - y) // 18
+            for k, line in enumerate(wrap_text(problem, x1 - x0, 0.42, UI_FONT)[:max(1, room)]):
+                put_text(c, line, (x0 + 2, y + 4 + k * 18), 0.42, C_TEXT if cam.controls.capture_box else C_DIM)
         self.draw_button(c, (x0, VIEW_Y + VIEW_H - 52, x1, VIEW_Y + VIEW_H - 8), "Done", "check", "K", C_GREEN,
                          action=("cmd", "camera"))
 
@@ -3248,7 +3647,7 @@ class App:
             self.camera_panel = False
             self.slider_drag = None
         elif action == "switch":
-            if self.camera.switch():
+            if self.camera.switch(on_change=cam.close):
                 cam.sync(self.camera)
                 summary = cam.controls.summary() if cam.controls else ""
                 self.toast(f"Camera {self.camera.index + 1}: {cam.name} ({summary})")

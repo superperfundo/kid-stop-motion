@@ -55,7 +55,9 @@ macOS with [Homebrew](https://brew.sh/): `brew install ffmpeg`. On Debian/Ubuntu
 python3 stopmotion.py
 ```
 
-First you'll see your movies: pick one to keep working on, or **New movie**. Then the studio
+The studio asks the camera for the sharpest picture it can send at a usable speed (up to 4K;
+see `CAMERA_MAX_SIZE` under [Settings](#settings)). First you'll see your movies: pick one to keep
+working on, or **New movie**. Then the studio
 opens with the live camera, big buttons down the right, and the timeline along the bottom. If
 the picture is upside down, press `K` then `R` (it remembers, for each camera). If it's the wrong
 camera, press `K` then `C`.
@@ -186,14 +188,28 @@ usual jobs.) Above the live picture, a label shows what's locked; click it to op
   what auto had, if it was on auto). On cameras without exposure control, the app darkens or
   brightens the picture itself instead.
 
-These controls work on macOS with USB webcams. The app talks to the camera directly with standard
-USB Video Class requests, which almost every USB webcam understands, because macOS's own camera
-APIs can't set a focus distance. Each camera gets the controls it actually has: a webcam with a
-fixed-focus lens, for instance, shows focus as `n/a` but can still lock exposure and white
-balance. Built-in laptop cameras aren't USB, so they show `n/a` for all three, and `-` / `+`
-brighten the picture in the app instead. The terminal lists what each camera can control. The app
-puts the camera back on auto when you switch cameras or quit. These controls aren't available on
-Windows or Linux yet; switching, flipping and `-` / `+` work everywhere.
+Each camera gets the controls it actually has: a webcam with a fixed-focus lens, for instance,
+shows focus as `n/a` but can still lock exposure and white balance. The terminal lists what each
+camera can control. The app puts the camera back on auto when you switch cameras or quit.
+Switching, flipping and `-` / `+` work with every camera.
+
+- **macOS:** USB webcams. The app talks to the camera directly with standard USB Video Class
+  requests, which almost every USB webcam understands, because macOS's own camera APIs can't set
+  a focus distance. Built-in laptop cameras aren't USB, so they show `n/a` for all three, and
+  `-` / `+` brighten the picture in the app instead.
+- **Linux:** most USB webcams, through the system's own video interface (V4L2), which also tells
+  the app each camera's real ranges. If the panel says there's no permission, add yourself to the
+  `video` group.
+- **Windows:** webcams, through DirectShow (the app opens cameras that way so it can reach their
+  settings). Windows doesn't tell the app the ranges, so the sliders start from typical ones; if
+  the camera refuses a value, the app moves on to the next one it takes, and when a slider goes
+  past the end of the camera's range, it finds where the range ends and shrinks the slider to
+  match. Exposure on Windows moves in whole stops, so `-` / `+` go a whole stop at a time.
+- **HDMI capture boxes** (a Cam Link or a cheap HDMI-to-USB dongle, for a camera with HDMI out)
+  pass the picture along but not the camera's settings. The panel says "set it on the camera":
+  use the camera's own manual focus, exposure and white balance, which is the best way to shoot
+  stop motion anyway. The app spots them by name, or by having no focus or exposure control at
+  all.
 
 ### How fine the control is depends on the camera
 
@@ -236,7 +252,12 @@ Near the top of `stopmotion.py`:
   it in the studio with `V`.)
 - `CAMERA_INDEX = 0`: which camera to start with (or run `python3 stopmotion.py --camera 1`).
   `K` then `C` switches while you work.
-- `EXPOSURE_STEP = 1 / 3`: how many stops each `-` / `+` changes the exposure by.
+- `CAMERA_MAX_SIZE = (3840, 2160)`: the sharpest picture to ask the camera for. Cameras that can't
+  manage it give their best below it, and a size the camera only sends at under 10 pictures a
+  second is skipped. Set `(1920, 1080)` for smaller files and a snappier studio on an older
+  computer.
+- `EXPOSURE_STEP = 1 / 3`: how many stops each `-` / `+` changes the exposure by (at least a
+  whole stop on Windows, where cameras have nothing finer).
 - `PROJECTS_DIR`: where new movies go (or run with `--projects-dir some/folder`).
 - `ONION_OPACITY`, `AUTO_CAPTURE_SECONDS`, `TITLE_SECONDS`, `TRANSITION_SECONDS`,
   `SHUTTER_SOUND`.
