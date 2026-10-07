@@ -195,7 +195,7 @@ def make_app(tmp, script=(), camera=None):
     camera = camera or FakeCamera()
     app = sm.App(display, camera, projects_dir=tmp)
     if camera.uvc is not None:
-        app.cam_setup.make_controls = lambda index: sm.CameraControls(index, usb=camera.uvc, name="Fake C920")
+        app.cam_setup.make_controls = lambda cam: sm.CameraControls(cam.index, usb=camera.uvc, name="Fake C920")
     app.speaker = FakeSpeaker()
     app.recorder_factory = FakeRecorder
     app.countdown_seconds = 0
@@ -209,3 +209,155 @@ def run(app, open_path=None):
         pass
     finally:
         app.shutdown()
+
+
+class FakeVideoCapture:
+    """An OpenCV VideoCapture that answers size requests the way real cameras
+    do. `modes` is {(w, h): fps}. A size it hasn't got gets, by `style`:
+    "nearest" (macOS, Linux), "default" (keeps what it had) or "fail" (Windows
+    DirectShow: no pictures until a size it has is asked for)."""
+
+    def __init__(self, modes, style="nearest", start=(640, 480), backend="AVFOUNDATION"):
+        self.modes = dict(modes)
+        self.style = style
+        self.size = start
+        self.backend = backend
+        self.asked = []
+        self.fourcc = None
+        self._want = {}
+
+    def isOpened(self):
+        return True
+
+    def getBackendName(self):
+        return self.backend
+
+    def set(self, prop, value):
+        import cv2
+        if prop == cv2.CAP_PROP_FOURCC:
+            self.fourcc = value
+            return True
+        if prop in (cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT):
+            self._want[prop] = int(value)
+            if len(self._want) == 2:
+                want = (self._want[cv2.CAP_PROP_FRAME_WIDTH], self._want[cv2.CAP_PROP_FRAME_HEIGHT])
+                self._want = {}
+                self.asked.append(want)
+                if want in self.modes:
+                    self.size = want
+                elif self.style == "nearest":
+                    self.size = min(self.modes, key=lambda m: abs(m[0] - want[0]) + abs(m[1] - want[1]))
+                elif self.style == "fail":
+                    self.size = None
+            return True
+        return False
+
+    def get(self, prop):
+        import cv2
+        if prop == cv2.CAP_PROP_FPS:
+            return self.modes.get(self.size, 0) if self.size else 0
+        return 0
+
+    def read(self):
+        if self.size is None:
+            return False, None
+        w, h = self.size
+        return True, np.zeros((h, w, 3), np.uint8)
+
+    def release(self):
+        pass
+
+
+class FakeV4L2:
+    """Pretend /dev/videoN, answering the kernel (V4L2) requests the app makes.
+    `controls` is {control id: [min, max, step, value]}; `menus` lists the
+    valid entries of menu controls."""
+
+    def __init__(self, controls, menus=None, name="HD Pro Webcam C920", disabled=()):
+        self.controls = {cid: list(c) for cid, c in controls.items()}
+        self.menus = menus or {}
+        self.name = name
+        self.disabled = set(disabled)
+        self.opened = []
+
+    def open(self, path, flags):
+        import os
+        self.opened.append(path)
+        return os.open(os.devnull, os.O_RDONLY)
+
+    def ioctl(self, fd, request, buf):
+        import errno
+        import struct
+        if request == sm.VIDIOC_QUERYCAP:
+            name = self.name.encode()
+            buf[16:16 + len(name)] = name
+            return 0
+        cid = struct.unpack_from("<I", buf)[0]
+        if cid not in self.controls:
+            raise OSError(errno.EINVAL, "Invalid argument")
+        low, high, step, value = self.controls[cid]
+        if request == sm.VIDIOC_QUERYCTRL:
+            flags = sm.V4L2_CTRL_FLAG_DISABLED if cid in self.disabled else 0
+            # struct v4l2_queryctrl: id, type, name[32], min, max, step, default, flags, reserved[2] (68 bytes)
+            buf[:] = struct.pack("<II32siiiiI2I", cid, 1, b"name", low, high, step, value, flags, 0, 0)
+        elif request == sm.VIDIOC_QUERYMENU:
+            if struct.unpack_from("<II", buf)[1] not in self.menus.get(cid, ()):
+                raise OSError(errno.EINVAL, "Invalid argument")
+        elif request == sm.VIDIOC_G_CTRL:
+            buf[:] = struct.pack("<Ii", cid, value)
+        elif request == sm.VIDIOC_S_CTRL:
+            new = struct.unpack("<Ii", buf)[1]
+            if not low <= new <= high:
+                raise OSError(errno.ERANGE, "Numerical result out of range")
+            self.controls[cid][3] = new
+        return 0
+
+    def value(self, cid):
+        return self.controls[cid][3]
+
+
+class FakeDirectShow:
+    """OpenCV's DirectShow capture as the app sees it: get() gives -1 for what
+    the camera hasn't got (and for auto exposure, which DirectShow can't
+    report); set() refuses values outside the camera's real ranges. The
+    picture's brightness follows the exposure, like a real camera."""
+
+    def __init__(self, ranges=None, missing=(), auto_exposure=-6):
+        import cv2
+        self.ranges = ranges or {cv2.CAP_PROP_EXPOSURE: (-11, -2), cv2.CAP_PROP_FOCUS: (0, 250),
+                                 cv2.CAP_PROP_WB_TEMPERATURE: (2800, 6500)}
+        self.values = {cv2.CAP_PROP_EXPOSURE: -4, cv2.CAP_PROP_FOCUS: 0, cv2.CAP_PROP_WB_TEMPERATURE: 4000,
+                       cv2.CAP_PROP_AUTOFOCUS: 1, cv2.CAP_PROP_AUTO_WB: 1, cv2.CAP_PROP_AUTO_EXPOSURE: 1}
+        self.missing = set(missing)
+        self.auto_exposure = auto_exposure      # what auto picks (never reported)
+
+    def getBackendName(self):
+        return "DSHOW"
+
+    def get(self, prop):
+        import cv2
+        if prop in self.missing or prop == cv2.CAP_PROP_AUTO_EXPOSURE:
+            return -1
+        return self.values.get(prop, -1)
+
+    def set(self, prop, value):
+        import cv2
+        if prop in self.missing:
+            return False
+        if prop in self.ranges and not self.ranges[prop][0] <= value <= self.ranges[prop][1]:
+            return False
+        if prop == cv2.CAP_PROP_AUTOFOCUS:
+            value = 1 if round(value) == 1 else 2      # DirectShow's flags
+        self.values[prop] = value
+        return True
+
+    def exposure(self):
+        import cv2
+        if self.values[cv2.CAP_PROP_AUTO_EXPOSURE]:
+            return self.auto_exposure
+        return self.values[cv2.CAP_PROP_EXPOSURE]
+
+    def picture(self, size):
+        light = min(1.0, 0.25 * 2 ** (self.exposure() + 6))
+        w, h = size
+        return np.full((h, w, 3), 255 * light ** (1 / 2.2), np.uint8)
