@@ -17,8 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import stopmotion as sm  # noqa: E402
-from fakes import (FakeCamera, FakeDirectShow, FakeRecorder, FakeUVC, FakeV4L2,  # noqa: E402
-                   FakeVideoCapture, make_app, run)
+from fakes import (FakeCamera, FakeDirectShow, FakeDisplay, FakeRecorder, FakeSpeaker,  # noqa: E402
+                   FakeUVC, FakeV4L2, FakeVideoCapture, make_app, run)
 
 RED, BLUE, GREEN = (0, 0, 255), (255, 0, 0), (0, 255, 0)
 
@@ -38,6 +38,280 @@ class TempDirTest(unittest.TestCase):
 
 
 # ------------------------------------------------------------------ project
+
+class SoundTrackTests(TempDirTest):
+    """Sound on the three tracks: clips, mixing, importing, and live recordings."""
+
+    def make_project(self, pictures=4):
+        p = sm.Project.create("Movie", self.tmp)
+        for k in range(pictures):
+            with p.change():
+                p.add_frame(solid(RED, (320, 180)), k)
+        return p
+
+    def tone(self, seconds=1.0, rate=16000):
+        t = np.arange(int(seconds * rate)) / rate
+        return (np.sin(2 * np.pi * 440 * t) * 8000).astype(np.int16).reshape(-1, 1)
+
+    def clip_on(self, p, track, seconds=1.0, start=0.0, name="tone"):
+        rel = p.save_recording(self.tone(seconds), 16000, stem=name)
+        with p.change():
+            return p.add_sound(track, rel, start, seconds, name)
+
+    def lanes_app(self, p):
+        app = sm.App(FakeDisplay(), FakeCamera(), projects_dir=self.tmp)
+        app.speaker = FakeSpeaker()
+        app.set_project(p)
+        self.addCleanup(app.shutdown)
+        app.draw_studio()                  # lays out the lanes (and their buttons)
+        return app
+
+    def at(self, app, action):
+        """Click the first thing with this action."""
+        for rect, found in app.hotspots:
+            if found == action:
+                x0, y0, x1, y1 = rect
+                return (x0 + x1) // 2, (y0 + y1) // 2
+        self.fail(f"no {action} on the timeline")
+
+    def click(self, app, x, y):
+        app.on_mouse(("down", x, y))
+        app.on_mouse(("up", x, y))
+
+    def test_an_old_voice_track_becomes_a_clip_on_dlg(self):
+        p = self.make_project()
+        rel = p.save_recording(self.tone(0.5), 16000, stem="voice")
+        write_legacy_voice(p, rel)
+        reopened = sm.Project.open(p.path)
+        (clip,) = reopened.tracks[0]["clips"]
+        self.assertEqual((clip["file"], clip["start"], clip["name"]), (rel, 0.0, "voice"))
+        self.assertAlmostEqual(clip["length"], 0.5, places=2)
+        self.assertNotIn("audio", reopened.doc)
+        self.assertEqual(sm.Project.open(p.path).tracks[0]["clips"][0]["id"], clip["id"])   # kept, not redone
+
+    def test_the_mix_places_trims_and_scales_each_clip(self):
+        data = np.arange(200000, dtype=np.float32).reshape(-1, 1).repeat(2, axis=1) / 1e6
+        mix = sm.SoundMix([(10, 88200, 5, data, 0.5)])
+        out = mix.render(0, 44100)
+        self.assertTrue(np.all(out[:10] == 0))                       # nothing before the clip starts
+        self.assertAlmostEqual(out[10, 0], 0.0, places=6)            # the fade in starts from silence
+        self.assertAlmostEqual(out[30000, 0], 0.5 * data[30000 - 10 + 5, 0], places=6)
+        later = mix.render(44100, 1000)                              # the same clip, further on
+        self.assertAlmostEqual(later[0, 0], 0.5 * data[5 + 44100 - 10, 0], places=6)
+        self.assertTrue(np.all(mix.render(100000, 10) == 0))         # and after it has ended
+
+    def test_clips_on_a_muted_track_or_under_a_volume(self):
+        p = self.make_project()
+        self.clip_on(p, 0, 1.0)
+        self.clip_on(p, 2, 1.0)
+        with p.change():
+            p.tracks[2]["muted"] = True
+        self.assertEqual(len(sm.SoundMix.from_project(p).spans), 1)
+        with p.change():
+            p.tracks[0]["volume"] = 50
+        (span,) = sm.SoundMix.from_project(p).spans
+        self.assertEqual(span[4], 0.5)
+
+    def test_a_clip_whose_file_cannot_be_read_is_named(self):
+        p = self.make_project()
+        bad = p.folder / "audio" / "bad.wav"
+        bad.parent.mkdir(exist_ok=True)
+        bad.write_bytes(b"not a sound")
+        with p.change():
+            p.tracks[1]["clips"].append({"id": "x", "file": "audio/bad.wav", "name": "bad", "start": 0.0,
+                                         "trim": 0.0, "length": 1.0, "source": 1.0})
+        mix = sm.SoundMix.from_project(p)
+        self.assertEqual(mix.spans, [])
+        self.assertEqual(mix.missing, ["audio/bad.wav"])
+
+    def test_importing_any_wav_gives_a_stereo_clip_at_the_mix_rate(self):
+        src = self.tmp / "door.wav"
+        sm.write_wav(src, self.tone(1.5), 16000)
+        p = self.make_project()
+        with mock.patch.object(sm, "has_ffmpeg", return_value=False):
+            clip = p.import_sound_file(src, 1, 2.0)
+        self.assertEqual((clip["start"], clip["name"]), (2.0, "door"))
+        self.assertAlmostEqual(clip["length"], 1.5, places=2)
+        samples, rate = sm.read_wav(p.file_path(clip["file"]))
+        self.assertEqual((rate, samples.shape[1]), (sm.MIX_RATE, 2))
+        self.assertIs(p.tracks[1]["clips"][0], clip)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg")
+    def test_importing_with_ffmpeg_reads_more_kinds_of_sound(self):
+        src = self.tmp / "song.mp3"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "sine=frequency=330:duration=1", str(src)], check=True)
+        p = self.make_project()
+        clip = p.import_sound_file(src, 2, 0.0)
+        self.assertAlmostEqual(clip["length"], 1.0, delta=0.1)
+        samples, rate = sm.read_wav(p.file_path(clip["file"]))
+        self.assertEqual((rate, samples.shape[1]), (sm.MIX_RATE, 2))
+
+    def test_other_formats_need_ffmpeg(self):
+        src = self.tmp / "song.mp3"
+        src.write_bytes(b"ID3")
+        p = self.make_project()
+        with mock.patch.object(sm, "has_ffmpeg", return_value=False):
+            with self.assertRaises(ValueError) as caught:
+                p.import_sound_file(src, 0, 0.0)
+        self.assertIn("ffmpeg", str(caught.exception))
+        self.assertEqual(p.tracks[0]["clips"], [])
+
+    def test_dragging_a_clip_moves_it_and_trims_its_ends(self):
+        p = self.make_project()
+        clip = self.clip_on(p, 0, 1.0, start=1.0)
+        app = self.lanes_app(p)
+        scale = app.sound_scale()
+        x = app.x_of(1.5)
+        y = app.lane_top(0) + sm.LANE_H // 2
+        app.on_mouse(("down", x, y))                      # the clip starts at 1.0 s; grab it at 1.5 s
+        app.on_mouse(("drag", x + int(0.5 * scale), y))
+        app.on_mouse(("up", x + int(0.5 * scale), y))
+        self.assertAlmostEqual(p.tracks[0]["clips"][0]["start"], 1.5, delta=0.05)
+        app.draw_studio()
+        # Trim the right end in by 0.4 s: it now ends at 2.1 s, so the clip is 0.6 s long.
+        end = app.x_of(1.5 + 1.0)
+        app.on_mouse(("down", end - 3, y))
+        app.on_mouse(("drag", end - 3 - int(0.4 * scale), y))
+        app.on_mouse(("up", end - 3 - int(0.4 * scale), y))
+        self.assertAlmostEqual(p.tracks[0]["clips"][0]["length"], 0.6, delta=0.05)
+        app.draw_studio()
+        # Trim the left end in by 0.2 s: the sound starts 0.2 s further into the clip, and the clip starts later.
+        start = app.x_of(1.5)
+        app.on_mouse(("down", start + 3, y))
+        app.on_mouse(("drag", start + 3 + int(0.2 * scale), y))
+        app.on_mouse(("up", start + 3 + int(0.2 * scale), y))
+        moved = p.tracks[0]["clips"][0]
+        self.assertAlmostEqual(moved["trim"], 0.2, delta=0.05)
+        self.assertAlmostEqual(moved["start"], 1.7, delta=0.05)
+        self.assertEqual(moved["id"], clip["id"])
+
+    def test_a_clip_can_be_dragged_onto_another_track(self):
+        p = self.make_project()
+        self.clip_on(p, 0, 1.0, start=1.0)
+        app = self.lanes_app(p)
+        x, y = app.x_of(1.5), app.lane_top(0) + sm.LANE_H // 2
+        app.on_mouse(("down", x, y))
+        app.on_mouse(("drag", x, y + 40))
+        app.on_mouse(("up", x, y + 40))
+        self.assertEqual(p.tracks[0]["clips"], [])
+        self.assertEqual(p.tracks[1]["clips"][0]["name"], "tone")
+
+    def test_keys_copy_and_delete_the_picked_sound(self):
+        p = self.make_project()
+        self.clip_on(p, 0, 1.0, start=1.0)
+        app = self.lanes_app(p)
+        x, y = app.x_of(1.5), app.lane_top(0) + sm.LANE_H // 2
+        self.click(app, x, y)
+        app.on_key(ord("d"))                          # copies the sound, just after it
+        self.assertEqual(len(p.tracks[0]["clips"]), 2)
+        self.assertAlmostEqual(p.tracks[0]["clips"][1]["start"], 2.0, places=2)
+        app.on_key(ord("x"))                          # deletes the copy, which is picked
+        self.assertEqual(len(p.tracks[0]["clips"]), 1)
+        self.assertEqual(p.frame_count(), 4)          # the pictures were left alone
+
+    def test_track_buttons_mute_and_change_volume(self):
+        p = self.make_project()
+        app = self.lanes_app(p)
+        self.click(app, *self.at(app, ("track_mute", 1)))
+        self.assertTrue(p.tracks[1]["muted"])
+        self.click(app, *self.at(app, ("track_volume", 1)))
+        self.assertEqual(p.tracks[1]["volume"], 50)
+
+    def test_import_puts_the_files_on_the_track_picked(self):
+        src = self.tmp / "boom.wav"
+        sm.write_wav(src, self.tone(0.5), 16000)
+        p = self.make_project()
+        app, display = make_app(self.tmp, ["i", "2", None])
+        app.file_picker = lambda: [str(src)]
+        with mock.patch("builtins.print"):
+            run(app, p.path)
+        (clip,) = sm.Project.open(p.path).tracks[1]["clips"]
+        self.assertEqual(clip["name"], "boom")
+        self.assertIn("Added 1 sound to SFX", app.toast_text)
+
+    def test_the_file_window_failing_says_why(self):
+        p = self.make_project()
+        app, display = make_app(self.tmp, ["i", None])
+
+        def no_window():
+            raise RuntimeError("The file window needs tkinter.")
+
+        app.file_picker = no_window
+        with mock.patch("builtins.print"):
+            run(app, p.path)
+        self.assertIn("tkinter", app.toast_text)
+
+    def test_live_recording_is_a_clip_with_its_sound(self):
+        def wait():
+            time.sleep(0.25)
+
+        with mock.patch.object(sm, "sound_problem", return_value=None):
+            app, display = make_app(self.tmp, ["g", wait, wait, "g", None])
+            p = self.make_project(pictures=2)
+            run(app, p.path)
+        (item,) = [it for it in sm.Project.open(p.path).items if it["kind"] == "live"]
+        self.assertGreater(item["seconds"], 0.3)
+        self.assertTrue(p.file_path(item["file"]).is_file())
+        self.assertTrue(p.file_path(item["audio"]).is_file())
+        plan = sm.build_plan(sm.Project.open(p.path))
+        self.assertEqual(sum(1 for step in plan if step[0] == "video"), round(item["seconds"] * p.fps))
+
+    def test_a_live_clip_shows_its_own_pictures(self):
+        size = (160, 120)
+        writer = sm.open_video_writer(self.tmp / "clip.mp4", sm.LIVE_FPS, size)
+        self.assertIsNotNone(writer)
+        for k in range(30):
+            writer.write(solid(BLUE, size))
+        writer.release()
+        clip = sm.LiveClip(self.tmp / "clip.mp4", sm.LIVE_FPS)
+        picture = clip.frame_at(0.5)
+        self.assertEqual(picture.shape[:2], (120, 160))
+        self.assertLess(np.abs(picture.astype(int) - np.array(BLUE)).mean(), 40)
+        clip.close()
+
+    def test_a_live_clip_exports_with_its_sound(self):
+        p = self.make_project(pictures=2)
+        size = even_size_for(p)
+        rel_video, rel_audio = f"{sm.LIVE_DIR}/live.mp4", f"{sm.AUDIO_DIR}/live sound.wav"
+        p.file_path(sm.LIVE_DIR).mkdir(exist_ok=True)
+        writer = sm.open_video_writer(p.file_path(rel_video), sm.LIVE_FPS, size)
+        for _ in range(sm.LIVE_FPS):
+            writer.write(solid(GREEN, size))
+        writer.release()
+        sm.write_wav(p.file_path(rel_audio), self.tone(1.0), 16000)
+        with p.change():
+            p.add_live(1, rel_video, rel_audio, 1.0)
+        out = self.tmp / "movie.mp4"
+        ok, note = sm.export_movie(p, out)
+        self.assertTrue(ok, note)
+        self.assertTrue(out.is_file())
+        self.assertFalse(any(".partial" in f.name for f in self.tmp.iterdir()))
+
+    def test_tidying_keeps_the_sounds_and_live_video_a_project_uses(self):
+        p = self.make_project()
+        used = self.clip_on(p, 0, 1.0)
+        stray = p.folder / "audio" / "stray.wav"
+        sm.write_wav(stray, self.tone(0.2), 16000)
+        (p.folder / sm.LIVE_DIR).mkdir(exist_ok=True)
+        old_video = p.folder / sm.LIVE_DIR / "old.mp4"
+        old_video.write_bytes(b"x")
+        p.tidy()
+        self.assertTrue(p.file_path(used["file"]).is_file())
+        self.assertFalse(stray.exists())
+        self.assertFalse(old_video.exists())
+
+
+def even_size_for(p):
+    return sm.even_size(*p.size)
+
+
+def write_legacy_voice(p, rel):
+    """Write a project the way the last version did: one voice track, under 'audio'."""
+    doc = json.loads(p.path.read_text(encoding="utf-8"))
+    doc["audio"] = {"file": rel}
+    p.path.write_text(json.dumps(doc), encoding="utf-8")
+
 
 class ProjectFileTests(TempDirTest):
     def test_new_project_layout(self):
@@ -180,13 +454,14 @@ class ProjectFileTests(TempDirTest):
         p = sm.Project.create("Movie", self.tmp)
         (p.folder / "audio").mkdir()
         (p.folder / "audio" / "voice.wav").write_bytes(b"")
-        with p.change():
-            p.doc["audio"] = {"file": "audio/voice.wav"}
+        write_legacy_voice(p, "audio/voice.wav")
+        first = sm.Project.open(p.path)            # the first open repairs it, and says so
+        self.assertFalse(first.has_sound())
+        self.assertIn("can't be played", " ".join(first.notes))
         app, display = make_app(self.tmp, ["p", None, "x", None])
         with mock.patch("builtins.print"), mock.patch.object(sm, "sound_module", return_value=object()):
             run(app, p.path)
         self.assertIsNotNone(display.last)
-        self.assertIsNone(app.audio_seconds())
 
     def test_undo_brings_back_the_movie_size(self):
         p = sm.Project.create("Movie", self.tmp)
@@ -422,7 +697,8 @@ class MovieTests(TempDirTest):
         rate = 16000
         t = np.arange(rate * 5) / rate                 # 5 s of sound for a shorter movie
         with p.change():
-            p.set_audio((np.sin(2 * np.pi * 330 * t) * 9000).astype(np.int16), rate)
+            rel = p.save_recording((np.sin(2 * np.pi * 330 * t) * 9000).astype(np.int16), rate)
+            p.add_sound(0, rel, 0.0, 5.0, "tone")
             p.doc["end_transition"] = sm.make_transition("fade", p.fps)
         out = self.tmp / "movie.mp4"
         calls = []
@@ -659,18 +935,18 @@ class StudioTests(TempDirTest):
                 mock.patch.object(sm, "sound_module", return_value=object()):
             script = ["space", "space", None, "r", None, None, "x", None, "p", None, "x", None]
             app, _ = self.open_app(script)
-        audio = app.project.audio_file()
-        self.assertIsNotNone(audio)
-        samples, rate = sm.read_wav(audio)
-        self.assertEqual(rate, 16000)
-        self.assertEqual(app.speaker.played, [(len(samples), rate)])
+        (clip,) = app.project.tracks[0]["clips"]          # the voice goes on DLG, from the start
+        self.assertEqual(clip["name"], "voice")
+        self.assertEqual((clip["start"], clip["trim"]), (0.0, 0.0))
+        self.assertAlmostEqual(clip["length"], 1.0, places=2)
+        self.assertEqual(app.speaker.played, [0.0])
 
     def test_silent_recording_is_not_kept(self):
         FakeRecorder.samples = np.zeros((1000, 1), np.int16)
         self.addCleanup(setattr, FakeRecorder, "samples", None)
         with mock.patch.object(sm, "sound_problem", return_value=None):
             app, _ = self.open_app(["r", None, "x", None])
-        self.assertIsNone(app.project.audio_file())
+        self.assertFalse(app.project.has_sound())
         self.assertIn("silent", app.toast_text)
 
     def test_quit_needs_two_presses(self):

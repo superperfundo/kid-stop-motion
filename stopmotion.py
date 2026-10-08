@@ -80,6 +80,7 @@ TITLE_SECONDS = 2.0          # how long a new title card stays on screen
 TRANSITION_SECONDS = 0.75
 SHUTTER_SOUND = True         # a little click when a picture is taken
 WINDOW_SCALE = 1.0           # try 0.8 if the window is too big for your screen
+MAX_LIVE_SECONDS = 300         # the longest live recording (G), in seconds
 WRITE_LAUNCHERS = True       # put an "Open <movie>" double-click file in each project folder
 
 # ----------------------------------------------------------------- constants
@@ -89,6 +90,13 @@ PROJECT_FORMAT = "kid-stop-motion"
 PROJECT_VERSION = 1
 FRAMES_DIR = "frames"
 AUDIO_DIR = "audio"
+LIVE_DIR = "live"                     # live recordings: the video, and its sound
+TRACK_NAMES = ("DLG", "SFX", "MUSIC")  # dialogue, sound effects and music: one lane each
+MAX_TRACK_VOLUME = 150                # percent
+MIX_RATE = 44100                      # every sound is mixed at this rate, in stereo
+MIN_CLIP_SECONDS = 0.1
+FADE_SECONDS = 0.01                   # clips fade in and out this much, so cutting one doesn't click
+LIVE_FPS = 30                         # the rate live recordings are captured at
 BACKUPS_DIR = "backups"
 TRASH_DIR = "trash"
 LOCK_FILE = ".in-use"
@@ -221,8 +229,8 @@ def title_item(lines, style=0, hold=None, fps=FPS):
 
 def item_key(item):
     """Identifies what an item looks like (frame files never change once written)."""
-    if item["kind"] == "frame":
-        return ("frame", item["file"])
+    if item["kind"] in ("frame", "live"):
+        return (item["kind"], item["file"])
     return ("title", tuple(item.get("lines", ())), item.get("style", 0))
 
 
@@ -274,7 +282,7 @@ def new_document(name, fps=FPS):
         "frame_goal": 0,
         "items": [],
         "end_transition": None,
-        "audio": None,
+        "tracks": default_tracks(),
     }
 
 
@@ -283,7 +291,8 @@ class Project:
 
         <folder>/<name>.stopmo   the project file (JSON) - open this one
         <folder>/frames/         every picture, one file each
-        <folder>/audio/          the voice track
+        <folder>/audio/          the sounds on the tracks (as WAV files)
+        <folder>/live/           live recordings (video; their sound is in audio/)
         <folder>/backups/        older copies of the project file
         <folder>/trash/          pictures you deleted (kept, just in case)
 
@@ -291,7 +300,7 @@ class Project:
     flat battery never loses more than the picture being taken.
     """
 
-    EDIT_KEYS = ("items", "end_transition", "audio", "fps", "size")
+    EDIT_KEYS = ("items", "end_transition", "tracks", "fps", "size")
 
     def __init__(self, path, doc):
         self.path = Path(path)
@@ -329,12 +338,41 @@ class Project:
     def frame_count(self):
         return sum(1 for it in self.items if it["kind"] == "frame")
 
-    def audio_file(self):
-        audio = self.doc.get("audio")
-        if not audio:
-            return None
-        path = self.file_path(audio["file"])
-        return path if path.is_file() else None
+    @property
+    def tracks(self):
+        return self.doc["tracks"]
+
+    def has_sound(self):
+        return any(track["clips"] for track in self.tracks) or any(
+            item.get("audio") for item in self.items if item.get("kind") == "live")
+
+    def add_sound(self, track, rel, start, seconds, name):
+        """Put a sound file on a track, starting `start` seconds into the movie."""
+        clip = {"id": new_id(), "file": rel, "name": name[:40], "start": round(start, 3),
+                "trim": 0.0, "length": round(seconds, 3), "source": round(seconds, 3)}
+        self.tracks[track]["clips"].append(clip)
+        return clip
+
+    def import_sound_file(self, src, track, start):
+        """Copy a sound file into the project and put it on a track. Raises
+        ValueError (with a message for the grown-ups) if it can't be read."""
+        src = Path(src)
+        rel = f"{AUDIO_DIR}/{safe_filename(src.stem)} {new_id()[:6]}.wav"
+        dest = self.file_path(rel)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        convert_to_wav(src, dest)
+        seconds = sound_seconds(dest)
+        if not seconds:
+            dest.unlink(missing_ok=True)
+            raise ValueError(f"{src.name} has no sound in it")
+        return self.add_sound(track, rel, start, seconds, src.stem)
+
+    def add_live(self, index, video, audio, seconds):
+        """A live recording, put in the timeline at `index`. Its sound goes with it."""
+        item = {"kind": "live", "id": new_id(), "file": video, "audio": audio,
+                "seconds": round(seconds, 3), "video_fps": LIVE_FPS, "hold": 1, "transition": None}
+        self.items.insert(index, item)
+        return item
 
     # -- creating and opening
 
@@ -498,6 +536,47 @@ class Project:
             return True
         return False
 
+    def _repair_tracks(self, doc):
+        """The sound tracks, cleaned up. A project's old voice track becomes a clip on DLG."""
+        old_tracks = doc.get("tracks") if isinstance(doc.get("tracks"), list) else []
+        legacy = doc.pop("audio", None)
+        tracks, seen = default_tracks(), set()
+        for i, track in enumerate(tracks):
+            old = old_tracks[i] if i < len(old_tracks) and isinstance(old_tracks[i], dict) else {}
+            track["muted"] = bool(old.get("muted", False))
+            track["volume"] = int(clamp(num(old.get("volume"), 100), 0, MAX_TRACK_VOLUME))
+            for clip in old.get("clips") if isinstance(old.get("clips"), list) else []:
+                fixed = self._repair_clip(clip, seen)
+                if fixed is not None:
+                    track["clips"].append(fixed)
+        if isinstance(legacy, dict) and isinstance(legacy.get("file"), str):
+            fixed = self._repair_clip({"file": legacy["file"], "name": "voice"}, seen)
+            if fixed is not None:
+                tracks[0]["clips"].append(fixed)
+        return tracks
+
+    def _repair_clip(self, clip, seen):
+        """A clip, checked against its file. None (and a note) if it can't be used."""
+        if not isinstance(clip, dict) or not isinstance(clip.get("file"), str):
+            return None
+        rel = clip["file"]
+        if not self._ensure_file(rel):
+            self.notes.append("A sound file is missing, so its clip was left out.")
+            return None
+        seconds = sound_seconds(self.file_path(rel))
+        if seconds is None or seconds < MIN_CLIP_SECONDS:
+            self.notes.append(f"{Path(rel).name} can't be played, so its clip was left out.")
+            return None
+        trim = clamp(num(clip.get("trim"), 0.0), 0.0, seconds - MIN_CLIP_SECONDS)
+        length = clamp(num(clip.get("length"), seconds - trim), MIN_CLIP_SECONDS, seconds - trim)
+        cid = clip.get("id")
+        if not isinstance(cid, str) or cid in seen:
+            cid = new_id()
+        seen.add(cid)
+        name = str(clip.get("name") or Path(rel).stem)
+        return {"id": cid, "file": rel, "name": name[:40], "start": max(0.0, num(clip.get("start"), 0.0)),
+                "trim": trim, "length": length, "source": seconds}
+
     def _repair(self):
         """Fix anything odd in a loaded project. Returns True if it changed."""
         doc = self.doc
@@ -520,6 +599,10 @@ class Project:
                 if not self._ensure_file(item["file"]):
                     missing += 1          # kept (shown as a grey card) in case the file turns up again
                 default_hold = 1
+            elif kind == "live":
+                if not isinstance(item.get("file"), str):
+                    continue
+                default_hold = 1
             elif kind == "title":
                 lines = item.get("lines")
                 if not isinstance(lines, list):
@@ -541,11 +624,15 @@ class Project:
         doc["items"] = good
         if doc["end_transition"] is not None and not valid_transition(doc["end_transition"]):
             doc["end_transition"] = None
-        audio = doc.get("audio")
-        if audio is not None and not (isinstance(audio, dict) and isinstance(audio.get("file"), str)
-                                      and self._ensure_file(audio["file"])):
-            doc["audio"] = None
-            self.notes.append("The voice track file is missing.")
+        doc["tracks"] = self._repair_tracks(doc)
+        for item in doc["items"]:
+            if item["kind"] == "live":
+                item["seconds"] = max(MIN_CLIP_SECONDS, num(item.get("seconds"), 1.0))
+                item["video_fps"] = LIVE_FPS
+                if not isinstance(item.get("audio"), str) or not self._ensure_file(item["audio"]):
+                    item["audio"] = None
+                if not self._ensure_file(item["file"]):
+                    self.notes.append("A live recording's video is missing (shown as a grey card).")
         highest = max((file_number(p) for p in self._picture_files() + self._picture_files(TRASH_DIR)), default=0)
         if not isinstance(doc["next_frame"], int) or doc["next_frame"] <= highest:
             doc["next_frame"] = highest + 1
@@ -594,11 +681,10 @@ class Project:
             if not doc:
                 continue
             used |= {it.get("file") for it in doc["items"] if isinstance(it, dict) and it.get("kind") == "frame"}
-            if isinstance(doc.get("audio"), dict):
-                used.add(doc["audio"].get("file"))
+            used |= doc_files(doc)
         trash = self.folder / TRASH_DIR
         moved = 0
-        for sub in (FRAMES_DIR, AUDIO_DIR):
+        for sub in (FRAMES_DIR, AUDIO_DIR, LIVE_DIR):
             folder = self.folder / sub
             if not folder.is_dir():
                 continue
@@ -699,10 +785,11 @@ class Project:
         self.items.insert(index, item)
         return item
 
-    def set_audio(self, samples, samplerate):
-        rel = f"{AUDIO_DIR}/voice {now_stamp()}.wav"
+    def save_recording(self, samples, samplerate, folder=AUDIO_DIR, stem="voice"):
+        """Write microphone samples to a WAV file in the project. Returns its name in the project."""
+        rel = f"{folder}/{stem} {now_stamp()}.wav"
         write_wav(self.file_path(rel), samples, samplerate)
-        self.doc["audio"] = {"file": rel}
+        return rel
 
 
 def list_projects(folder):
@@ -754,8 +841,9 @@ def default_movie_name(folder):
 def build_plan(project):
     """Every frame of the finished movie, in order.
 
-    Each step is ("item", index) or ("mix", kind, a, b, t), a transition
-    frame part-way (t) from item a to item b, where None means black.
+    Each step is ("item", index), ("video", index, k) for picture k of a live
+    recording, or ("mix", kind, a, b, t): a transition frame part-way (t) from
+    item a to item b, where None means black.
     """
     items = project.items
     plan = []
@@ -767,7 +855,10 @@ def build_plan(project):
             for k in range(n):
                 t = k / n if prev is None else (k + 1) / (n + 1)
                 plan.append(("mix", tr["type"], prev, i, t))
-        plan.extend([("item", i)] * item["hold"])
+        if item["kind"] == "live":
+            plan.extend(("video", i, k) for k in range(max(1, round(item["seconds"] * project.fps))))
+        else:
+            plan.extend([("item", i)] * item["hold"])
     end = project.doc.get("end_transition")
     if end and items:
         n = end["frames"]
@@ -778,7 +869,7 @@ def build_plan(project):
 
 def plan_item(step):
     """The timeline item a movie frame belongs to."""
-    if step[0] == "item":
+    if step[0] in ("item", "video"):
         return step[1]
     return step[3] if step[3] is not None else step[2]
 
@@ -884,6 +975,7 @@ class Renderer:
         self.fit_within = tuple(fit_within) if fit_within else None
         self.cache = OrderedDict()
         self.cached_bytes = 0
+        self.clips = {}           # live recording id -> LiveClip
 
     @property
     def size(self):
@@ -908,9 +1000,23 @@ class Renderer:
             self.cache.move_to_end(key)
         return img
 
+    def live_clip(self, item):
+        clip = self.clips.get(item["id"])
+        if clip is None:
+            clip = self.clips[item["id"]] = LiveClip(self.project.file_path(item["file"]), item["video_fps"])
+        return clip
+
+    def close(self):
+        for clip in self.clips.values():
+            clip.close()
+        self.clips = {}
+
     def _make(self, item):
         if item["kind"] == "title":
             return render_title(item, self.size)
+        if item["kind"] == "live":           # its first picture stands for it (in transitions, say)
+            frame = self.live_clip(item).frame_at(0)
+            return fit_image(frame, self.size) if frame is not None else missing_picture(self.size)
         # Pictures are the movie's size, so when we want them much smaller, let
         # the JPEG decoder skip the detail (a lot quicker for 4K pictures).
         w, h = self.size
@@ -930,6 +1036,9 @@ class Renderer:
         items = self.project.items
         if step[0] == "item":
             return self.image(items[step[1]])
+        if step[0] == "video":
+            frame = self.live_clip(items[step[1]]).frame_at(step[2] / self.project.fps)
+            return fit_image(frame, self.size) if frame is not None else missing_picture(self.size)
         _, kind, a, b, t = step
         w, h = self.size
         black = np.zeros((h, w, 3), np.uint8)
@@ -990,6 +1099,223 @@ def read_wav(path):
     return np.frombuffer(data, dtype=np.int16).reshape(-1, channels), rate
 
 
+def num(value, default):
+    """value as a number, or default if it isn't one."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return default
+    return float(value)
+
+
+def default_tracks():
+    return [{"name": name, "clips": [], "muted": False, "volume": 100} for name in TRACK_NAMES]
+
+
+def doc_files(doc):
+    """Every sound and live recording file a project document uses."""
+    files = set()
+    for track in doc.get("tracks") if isinstance(doc.get("tracks"), list) else []:
+        if isinstance(track, dict):
+            files |= {clip.get("file") for clip in track.get("clips", []) if isinstance(clip, dict)}
+    for item in doc.get("items", []):
+        if isinstance(item, dict) and item.get("kind") == "live":
+            files |= {item.get("file"), item.get("audio")}
+    if isinstance(doc.get("audio"), dict):          # an old project's voice track
+        files.add(doc["audio"].get("file"))
+    return files
+
+
+def sound_seconds(path):
+    """How long a WAV file is, or None if it can't be read."""
+    try:
+        with wave.open(str(path), "rb") as w:
+            return w.getnframes() / w.getframerate()
+    except Exception:             # empty or damaged file
+        return None
+
+
+def load_sound(path):
+    """A WAV file as stereo floats at MIX_RATE, ready to mix."""
+    samples, rate = read_wav(path)
+    x = samples.astype(np.float32) / 32768.0
+    if x.shape[1] == 1:
+        x = np.repeat(x, 2, axis=1)
+    elif x.shape[1] > 2:
+        x = x[:, :2]
+    if rate != MIX_RATE and len(x) > 1:
+        at = np.arange(int(round(len(x) * MIX_RATE / rate))) * (rate / MIX_RATE)
+        x = np.stack([np.interp(at, np.arange(len(x)), x[:, c]) for c in (0, 1)], axis=1).astype(np.float32)
+    return x
+
+
+def convert_to_wav(src, dest):
+    """Write a sound file as a 16-bit stereo WAV at MIX_RATE, at dest.
+    ffmpeg reads most kinds of sound; without it, only WAV files."""
+    src, dest = Path(src), Path(dest)
+    if has_ffmpeg():
+        tmp = dest.with_name(dest.name + ".tmp")
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(src), "-vn",
+               "-ac", "2", "-ar", str(MIX_RATE), "-c:a", "pcm_s16le", "-f", "wav", str(tmp)]
+        done = subprocess.run(cmd, capture_output=True, text=True)
+        if done.returncode != 0:
+            tmp.unlink(missing_ok=True)
+            detail = (done.stderr or "").strip().splitlines()
+            raise ValueError(f"Couldn't read {src.name}" + (f": {detail[-1]}" if detail else ""))
+        os.replace(tmp, dest)
+    elif src.suffix.lower() == ".wav":
+        try:
+            x = load_sound(src)
+        except Exception:
+            raise ValueError(f"Couldn't read {src.name}. Installing ffmpeg reads more kinds of sound files.")
+        write_wav(dest, (np.clip(x, -1.0, 1.0) * 32767).astype(np.int16), MIX_RATE)
+    else:
+        raise ValueError(f"Installing ffmpeg is needed to add {src.suffix.lower()} files.")
+
+
+def live_sounds(project):
+    """(start, seconds, file) for the sound of each live recording, where it plays in the movie."""
+    first = {}
+    for n, step in enumerate(build_plan(project)):
+        if step[0] == "video":
+            first.setdefault(step[1], n)
+    return [(first[i] / project.fps, item["seconds"], item["audio"])
+            for i, item in enumerate(project.items)
+            if item["kind"] == "live" and item.get("audio") and i in first]
+
+
+class SoundMix:
+    """The sound of a movie: every clip on every track, added together.
+
+    It works from its own copy of the clips, so the sound device can ask for
+    it from its own thread while the studio carries on. A clip whose file
+    can't be read is left out (and named in `missing`)."""
+
+    def __init__(self, spans=(), missing=()):
+        self.spans = list(spans)          # (start, length, offset, samples, gain), all in samples
+        self.missing = list(missing)
+
+    @classmethod
+    def from_project(cls, project):
+        loaded, missing, spans = {}, [], []
+
+        def samples_of(rel):
+            if rel not in loaded:
+                try:
+                    loaded[rel] = load_sound(project.file_path(rel))
+                except Exception:
+                    loaded[rel] = None
+                    missing.append(rel)
+            return loaded[rel]
+
+        for track in project.tracks:
+            if track.get("muted"):
+                continue
+            gain = track.get("volume", 100) / 100
+            for clip in track["clips"]:
+                data = samples_of(clip["file"])
+                if data is not None:
+                    spans.append((round(clip["start"] * MIX_RATE), round(clip["length"] * MIX_RATE),
+                                  round(clip["trim"] * MIX_RATE), data, gain))
+        for start, seconds, rel in live_sounds(project):
+            data = samples_of(rel)
+            if data is not None:
+                spans.append((round(start * MIX_RATE), round(seconds * MIX_RATE), 0, data, 1.0))
+        return cls(spans, missing)
+
+    def render(self, first, count):
+        """The sound from sample `first` on, `count` samples of it, as stereo floats."""
+        out = np.zeros((count, 2), np.float32)
+        end, fade = first + count, max(1, round(FADE_SECONDS * MIX_RATE))
+        for start, length, offset, data, gain in self.spans:
+            lo, hi = max(first, start), min(end, start + length)
+            if lo >= hi:
+                continue
+            a = offset + (lo - start)
+            b = min(offset + (hi - start), len(data))
+            if b <= a:
+                continue
+            into = np.arange(lo - start, lo - start + (b - a))      # where each sample sits in its clip
+            ramp = np.minimum(np.minimum(into, length - 1 - into) / fade, 1.0)
+            out[lo - first:lo - first + (b - a)] += data[a:b] * (gain * ramp)[:, None].astype(np.float32)
+        return np.clip(out, -1.0, 1.0)
+
+
+def mixdown(project, seconds):
+    """The whole movie's sound (stereo floats at MIX_RATE), and the names of any clips left out."""
+    mix = SoundMix.from_project(project)
+    return mix.render(0, max(1, round(seconds * MIX_RATE))), mix.missing
+
+
+def clock_text(seconds):
+    """A time for the ruler: 5s, or 1:30."""
+    if seconds < 60:
+        return f"{seconds:g}s"
+    return f"{int(seconds) // 60}:{int(round(seconds)) % 60:02d}"
+
+
+def pick_sound_files():
+    """Ask for sound files in the system's own file window (Finder or Explorer).
+    Returns their paths: [] if none were picked. Raises RuntimeError if the window won't open."""
+    script = (
+        "import sys, tkinter\n"
+        "from tkinter import filedialog\n"
+        "root = tkinter.Tk()\n"
+        "root.withdraw()\n"
+        "names = filedialog.askopenfilenames(title='Add sounds', filetypes=[\n"
+        "    ('Sounds', '*.wav *.mp3 *.m4a *.aif *.aiff *.ogg *.flac'), ('All files', '*')])\n"
+        "root.destroy()\n"
+        "sys.stdout.write('\\n'.join(names))\n"
+    )
+    try:
+        done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    except OSError as e:
+        raise RuntimeError(f"Couldn't open the file window: {e}")
+    if done.returncode != 0:
+        if "tkinter" in (done.stderr or ""):
+            raise RuntimeError("The file window needs tkinter, which comes with Python from python.org.")
+        raise RuntimeError("Couldn't open the file window.")
+    return [line for line in done.stdout.splitlines() if line]
+
+
+def open_video_writer(path, fps, size):
+    """A video writer that works on this computer: H.264 where OpenCV has it, else MPEG-4. None if neither."""
+    for codec in ("avc1", "mp4v"):
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*codec), fps, size)
+        if writer.isOpened():
+            return writer
+    return None
+
+
+class LiveClip:
+    """Reads a live recording's pictures in order, seeking only when it must."""
+
+    def __init__(self, path, fps):
+        self.fps = fps
+        self.cap = cv2.VideoCapture(str(path))
+        self.at = 0               # the next picture the capture will give us
+        self.last = None
+
+    def frame_at(self, seconds):
+        """The picture at `seconds` into the recording (or the last one we had)."""
+        if self.cap is None:
+            return self.last
+        target = max(0, int(seconds * self.fps + 1e-6))
+        if target < self.at or target - self.at > 2 * self.fps:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+            self.at = target
+        while self.at <= target:
+            ok, frame = self.cap.read()
+            if not ok:
+                break
+            self.at += 1
+            self.last = frame
+        return self.last
+
+    def close(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+
 class MicRecorder:
     def __init__(self):
         self.chunks = []
@@ -1020,24 +1346,52 @@ class MicRecorder:
 
 
 class Speaker:
+    """Plays the movie's sound through the speakers as it's mixed (live), and
+    the shutter's click."""
+
     def __init__(self):
         self._click = None
+        self._stream = None
+        self._mix = None
+        self._first = 0           # the sample the movie started from
+        self._played = 0          # samples handed to the sound device so far
 
-    def play(self, samples, samplerate):
+    def play(self, mix, seconds):
+        """Start the mix at `seconds` into the movie. False if there's no sound to play."""
+        self.stop()
         sd = sound_module()
         if sd is None:
             return False
+        self._mix, self._first, self._played = mix, round(seconds * MIX_RATE), 0
         try:
-            sd.play(samples, samplerate)
-            return True
+            self._stream = sd.OutputStream(samplerate=MIX_RATE, channels=2, dtype="float32", callback=self._fill)
+            self._stream.start()
         except Exception as e:
             print(f"Could not play sound: {e}")
+            self._stream = None
             return False
+        return True
+
+    def _fill(self, outdata, frames, time_info, status):
+        try:
+            outdata[:] = self._mix.render(self._first + self._played, frames)
+        except Exception:
+            outdata[:] = 0
+        self._played += frames
+
+    def position(self):
+        """Where the movie is, in seconds, as it's heard. None if no sound is playing."""
+        if self._stream is None:
+            return None
+        latency = getattr(self._stream, "latency", 0) or 0
+        return max(0.0, (self._first + self._played) / MIX_RATE - latency)
 
     def stop(self):
-        if _SOUND["module"] is not None:
+        stream, self._stream = self._stream, None
+        if stream is not None:
             try:
-                _SOUND["module"].stop()
+                stream.stop()
+                stream.close()
             except Exception:
                 pass
 
@@ -1055,7 +1409,6 @@ class Speaker:
         except Exception:
             pass
 
-
 # -------------------------------------------------------------------- export
 
 def export_movie(project, out_path, progress=None):
@@ -1071,7 +1424,12 @@ def export_movie(project, out_path, progress=None):
     size = even_size(*project.size)
     renderer = Renderer(project, size)
     fps = project.fps
-    audio = project.audio_file()
+    sound_dir = tempfile.TemporaryDirectory()
+    audio, unheard = None, []
+    if has_ffmpeg() and project.has_sound():     # the whole movie's sound, mixed, as one WAV
+        samples, unheard = mixdown(project, len(plan) / fps)
+        audio = Path(sound_dir.name) / "sound.wav"
+        write_wav(audio, (samples * 32767).astype(np.int16), MIX_RATE)
     part = out_path.with_name(out_path.stem + ".partial" + out_path.suffix)
     note = ""
 
@@ -1127,14 +1485,19 @@ def export_movie(project, out_path, progress=None):
                     writer.write(img)
             finally:
                 writer.release()
-            note = "No ffmpeg, so the movie has no sound." if audio else ""
+            note = "No ffmpeg, so the movie has no sound." if project.has_sound() else ""
     except KeyboardInterrupt:
         part.unlink(missing_ok=True)
         return False, "Stopped making the movie."
     except BaseException:
         part.unlink(missing_ok=True)
         raise
+    finally:
+        renderer.close()
+        sound_dir.cleanup()
     os.replace(part, out_path)
+    if unheard:
+        note = note or "Some sounds couldn't be read, so they're not in the movie."
     return True, note
 
 
@@ -2643,6 +3006,7 @@ KEY_COMMANDS = {
     "z": "undo", "y": "redo", "s": "save", "n": "goal", "h": "help", "?": "help",
     "left": "prev", ",": "prev", "<": "prev", "right": "next", ".": "next", ">": "next",
     "home": "first", "end": "last", "q": "quit", "esc": "escape", "k": "camera",
+    "i": "import", "g": "live",
 }
 
 # While the camera panel (K) is open, these keys adjust the camera.
@@ -2653,12 +3017,14 @@ CAMERA_KEYS = {
 
 HELP_LINES = [
     ("SPACE", "Take a picture"),
-    ("P", "Play the movie (with your voice track)"),
+    ("P", "Play the movie, with all its sound"),
     ("O", "Ghost of the last picture on / off"),
     ("T", "Auto snap: a picture every 2 seconds"),
     ("C", "Add a title card (or edit the picked one)"),
     ("F", "Transition before the picked picture"),
-    ("R", "Record a voice track with the microphone"),
+    ("R", "Record your voice (on the DLG track)"),
+    ("I", "Add sound files to a track"),
+    ("G", "Live: record video with its sound"),
     ("V", "Speed: pictures per second"),
     ("E", "Make an MP4 movie"),
     ("L", "Projects: open another movie, or a new one"),
@@ -2706,8 +3072,17 @@ TILE_STEP = TILE_W + TILE_GAP
 TILES_X0 = 34
 TILE_Y = TL_Y + 12
 TILES_FIT = (CANVAS_W - 2 * TILES_X0 + TILE_GAP) // TILE_STEP
-EDIT_Y = TL_Y + 106
-CANVAS_H = TL_Y + 150
+SOUND_Y = TL_Y + 112                  # the sound lanes: a ruler, then one lane per track
+RULER_H = 20
+LANE_STEP, LANE_H = 30, 24
+LANE_X0, LANE_X1 = 176, CANVAS_W - 16
+SOUND_BOTTOM = SOUND_Y + RULER_H + LANE_STEP * len(TRACK_NAMES)
+EDIT_Y = SOUND_BOTTOM + 8
+CANVAS_H = EDIT_Y + 44
+TRACK_COLORS = (C_ORANGE, C_GREEN, C_PURPLE)
+PEAKS_PER_SECOND = 50                 # how finely clips show their waveforms
+SNAP_SECONDS = 0.1                    # clips move in steps of this
+MAX_SOUND_ZOOM = 400                  # pixels a second
 
 PICK_COLS, PICK_ROWS = 5, 3
 PICK_W, PICK_H = 228, 128
@@ -2850,6 +3225,11 @@ def draw_icon(img, name, cx, cy, s, color):
                 cv2.rectangle(img, (x - 2, y), (x + 1, y + 2), C_DARK, -1)
         pts = np.array([(cx - s // 4, cy - s // 3), (cx - s // 4, cy + s // 3), (cx + s // 3, cy)], np.int32)
         cv2.fillPoly(img, [pts], C_DARK, aa)
+    elif name == "note":                    # a music note
+        cv2.circle(img, (cx - s // 3, cy + s // 2), max(2, s // 3), color, -1, aa)
+        cv2.line(img, (cx - s // 3 + max(2, s // 3), cy + s // 2), (cx - s // 3 + max(2, s // 3), cy - s // 2),
+                 color, 2, aa)
+        cv2.line(img, (cx - s // 3 + max(2, s // 3), cy - s // 2), (cx + s // 2, cy - s // 3), color, 2, aa)
     elif name == "folder":
         pts = np.array([(cx - s, cy - s * 2 // 3), (cx - s // 4, cy - s * 2 // 3), (cx, cy - s // 3),
                         (cx + s, cy - s // 3), (cx + s, cy + s * 2 // 3), (cx - s, cy + s * 2 // 3)], np.int32)
@@ -2909,7 +3289,14 @@ class App:
         self.countdown_seconds = 3
         self._shift = False
         self._caps = False
-        self._audio_len = (None, None)
+        self._peaks = {}              # sound file -> waveform peaks, for the lanes
+        self.sound_sel = None         # (track, clip id) of the picked sound clip
+        self.sound_drag = None        # a clip being moved or trimmed
+        self.sound_zoom = None        # pixels a second, or None to fit the movie
+        self.sound_at = 0.0           # the second at the left edge of the lanes
+        self.playhead = None          # where the movie is, while it plays
+        self._movie_seconds = None    # the movie's length, worked out once per drawing
+        self.file_picker = pick_sound_files
         self._draw_failed = False
         self._camera_trouble = None
 
@@ -2925,6 +3312,8 @@ class App:
     def shutdown(self):
         self.speaker.stop()
         self.cam_setup.close()
+        if self.renderer is not None:
+            self.renderer.close()
         if self.project is not None:
             try:
                 moved = self.project.tidy()
@@ -3044,7 +3433,10 @@ class App:
                     pass
             self.project.unlock()
         self.project = project
+        if self.renderer is not None:
+            self.renderer.close()
         self.renderer = Renderer(project, fit_within=(VIEW_W, VIEW_H))
+        self.sound_sel, self.sound_drag, self.sound_zoom, self.sound_at = None, None, None, 0.0
         self.cursor = None
         self.insert_at = len(project.items)
         self.onion = bool(project.doc.get("onion_skin", True))
@@ -3165,6 +3557,8 @@ class App:
                 src = cv2.imread(str(self.project.file_path(item["file"])), cv2.IMREAD_REDUCED_COLOR_4)
                 if src is None:
                     src = missing_picture((TILE_W * 2, TILE_H * 2))
+            elif item["kind"] == "live":
+                src = self.renderer.image(item) if self.renderer else missing_picture((TILE_W * 2, TILE_H * 2))
             else:
                 w, h = self.project.size
                 src = render_title(item, (320, max(2, 320 * h // w)))
@@ -3218,6 +3612,8 @@ class App:
         mode = mode or ("live" if self.cursor is None else "review")
         c = self.blank()
         self.hotspots = []
+        self.playhead = (extra or {}).get("time")
+        self._movie_seconds = None
         if view is None:
             view = self.view_image(mode)
         c[VIEW_Y:VIEW_Y + VIEW_H, VIEW_X:VIEW_X + VIEW_W] = view
@@ -3233,8 +3629,8 @@ class App:
         p = self.project
         seconds = len(build_plan(p)) / p.fps
         stats = f"{plural(p.frame_count(), 'picture')}    {seconds:.1f} seconds    {p.fps} per second"
-        if p.audio_file():
-            stats += "    + voice"
+        if p.has_sound():
+            stats += "    + sound"
         stats_w = put_text(c, stats, (VIEW_W - 16, 32), 0.55, C_DIM, 1, align="right")
         put_text(c, fit_text(p.name, VIEW_W - stats_w - 60, 0.8, UI_BOLD), (16, 34), 0.8, C_TEXT, 1, UI_BOLD)
         put_text(c, "H = help", (CANVAS_W - 16, 32), 0.55, C_DIM, 1, align="right")
@@ -3251,6 +3647,8 @@ class App:
             item = p.items[self.cursor]
             if item["kind"] == "title":
                 label = f"TITLE CARD   {item['hold'] / p.fps:.1f} seconds"
+            elif item["kind"] == "live":
+                label = f"LIVE VIDEO   {item['seconds']:.1f} seconds"
             else:
                 label = f"PICTURE {self.picture_number(self.cursor)} OF {p.frame_count()}"
                 if item["hold"] > 1:
@@ -3258,8 +3656,9 @@ class App:
             pill(c, label, x0, y0, C_YELLOW, C_DARK)
         elif mode == "preview":
             pill(c, "PLAYING  -  press any key to stop", x0, y0, C_GREEN)
-        elif mode == "record":
-            pill(c, f"REC  {extra.get('elapsed', 0):.1f} s  -  press any key to stop", x0, y0, C_RED)
+        elif mode in ("record", "recording"):
+            label = "press G to stop" if mode == "recording" else "press any key to stop"
+            pill(c, f"REC  {extra.get('elapsed', 0):.1f} s  -  {label}", x0, y0, C_RED)
             level = min(1.0, extra.get("level", 0.0) ** 0.5 * 1.3)
             mx, my = x0 + 4, y0 + 50
             round_rect(c, mx, my, mx + 220, my + 14, C_DARK, 7)
@@ -3348,19 +3747,6 @@ class App:
         if action is not None:
             self.hotspots.append(((x0, y0, x1, y1), action))
 
-    def audio_seconds(self):
-        path = self.project.audio_file()
-        if path is None:
-            return None
-        key = (str(path), path.stat().st_mtime)
-        if self._audio_len[0] != key:
-            try:
-                with wave.open(str(path), "rb") as w:
-                    self._audio_len = (key, w.getnframes() / w.getframerate())
-            except Exception:             # empty or damaged file
-                self._audio_len = (key, None)
-        return self._audio_len[1]
-
     def draw_panel(self, c, mode):
         if self.camera_panel and self.cursor is not None:
             self.camera_panel = False          # picked a picture: back to the usual buttons
@@ -3369,7 +3755,7 @@ class App:
             return
         fill_rect(c, PANEL_X, VIEW_Y, CANVAS_W, VIEW_Y + VIEW_H, C_BAR)
         p = self.project
-        busy = mode in ("preview", "record", "countdown")
+        busy = mode in ("preview", "record", "countdown", "recording")
         item = p.items[self.cursor] if self.cursor is not None else None
         target = self.transition_target()
         if target is None:
@@ -3386,12 +3772,12 @@ class App:
             else:
                 where = f"before #{self.picture_number(target)}"
             tr_sub = f"{where}: {name}"
-        voice = self.audio_seconds()
+        sounds = sum(len(track["clips"]) for track in p.tracks)
         buttons = [
             ("snap", "Camera here" if item else "Take picture", "add pictures after this" if item else None,
              "SPACE", "snap", C_RED, False),
             ("stop", "Stop", None, "P", "play", C_GREEN, False) if mode == "preview" else
-            ("play", "Play movie", "with sound" if voice else None, "P", "play", C_GREEN, False),
+            ("play", "Play movie", f"with {plural(sounds, 'sound')}" if sounds else None, "P", "play", C_GREEN, False),
             ("ghost", "Ghost", "on: shows last picture" if self.onion else "off", "O", "onion", C_BUTTON, self.onion),
             ("auto", "Auto snap", f"on: every {AUTO_CAPTURE_SECONDS:g} seconds" if self.auto else "off", "T", "auto",
              C_BUTTON, self.auto),
@@ -3400,8 +3786,10 @@ class App:
             ("transition", "Transition", tr_sub, "F", "transition", C_BUTTON, False),
             ("stop", "Stop" if mode == "record" else "Cancel", None, "R", "record", C_RED, False) if mode in
             ("record", "countdown") else
-            ("mic", "Record voice", f"voice track: {voice:.1f} s" if voice else "use the microphone", "R", "record",
-             C_BUTTON, False),
+            ("mic", "Record voice", "to the DLG track", "R", "record", C_BUTTON, False),
+            ("note", "Add sound", "from a file, to a track", "I", "import", C_BUTTON, False),
+            ("stop", "Stop", "press G again", "G", "live", C_RED, False) if mode == "recording" else
+            ("camera", "Live video", "record with sound", "G", "live", C_BUTTON, False),
             ("speed", "Speed", f"{p.fps} pictures a second", "V", "speed", C_BUTTON, False),
             ("movie", "Make movie", "save an MP4 file", "E", "export", C_BUTTON, False),
             ("folder", "Projects", "open or start a movie", "L", "projects", C_BUTTON, False),
@@ -3447,6 +3835,8 @@ class App:
                 c[y:y + TILE_H, x:x + TILE_W] = self.thumb(item)
                 if item["kind"] == "title":
                     label, badge = "title", f"{item['hold'] / p.fps:.1f}s"
+                elif item["kind"] == "live":
+                    label, badge = "live", f"{item['seconds']:.0f}s"
                 else:
                     label, badge = str(numbers[i]), (f"x{item['hold']}" if item["hold"] > 1 else None)
                 if badge:
@@ -3476,10 +3866,247 @@ class App:
             b = self.drop_boundary(self.drag["x"])
             bx = TILES_X0 + (b - first) * TILE_STEP - TILE_GAP // 2
             cv2.line(c, (bx, TILE_Y - 8), (bx, TILE_Y + TILE_H + 8), C_YELLOW, 5)
+        self.draw_sound_lanes(c, mode)
         self.draw_edit_row(c, mode)
 
+    # -- the sound lanes
+
+    def movie_seconds(self):
+        if self._movie_seconds is None:       # (building the plan is slow for a long live clip)
+            self._movie_seconds = len(build_plan(self.project)) / self.project.fps
+        return self._movie_seconds
+
+    def sound_span(self):
+        """How many seconds the lanes can show: the movie, or further if a clip runs past it."""
+        ends = [clip["start"] + clip["length"] for track in self.project.tracks for clip in track["clips"]]
+        return max([self.movie_seconds()] + ends)
+
+    def sound_fit(self):
+        """Pixels a second that fit the whole movie across the lanes."""
+        return (LANE_X1 - LANE_X0) / max(8.0, self.sound_span())
+
+    def sound_scale(self):
+        return self.sound_fit() if self.sound_zoom is None else self.sound_zoom
+
+    def sound_zoom_by(self, direction):
+        fit = self.sound_fit()
+        new = clamp(self.sound_scale() * (1.5 if direction > 0 else 1 / 1.5), fit, MAX_SOUND_ZOOM)
+        self.sound_zoom = None if new <= fit * 1.01 else new
+
+    def x_of(self, seconds):
+        return int(LANE_X0 + (seconds - self.sound_at) * self.sound_scale())
+
+    def lane_top(self, i):
+        return SOUND_Y + RULER_H + LANE_STEP * i + (LANE_STEP - LANE_H) // 2
+
+    def lane_at(self, y, default):
+        """The track whose lane is at height y (or default, if none is)."""
+        for i in range(len(self.project.tracks)):
+            top = self.lane_top(i)
+            if top - 4 <= y <= top + LANE_H + 4:
+                return i
+        return default
+
+    def item_seconds(self, index):
+        """Where a timeline item starts in the movie, in seconds."""
+        for n, step in enumerate(build_plan(self.project)):
+            if step[0] != "mix" and step[1] == index:
+                return n / self.project.fps
+        return self.movie_seconds()
+
+    def sound_here(self):
+        """Where new sounds go: the picked picture's place in the movie (or where the camera is)."""
+        index = self.cursor if self.cursor is not None else self.insert_at
+        if index >= len(self.project.items):
+            return self.movie_seconds()
+        return self.item_seconds(index)
+
+    def clip_peaks(self, rel):
+        """Waveform peaks (0-1, PEAKS_PER_SECOND a second) for a sound file, cached."""
+        if rel not in self._peaks:
+            try:
+                samples = load_sound(self.project.file_path(rel))
+                size = max(1, MIX_RATE // PEAKS_PER_SECOND)
+                n = len(samples) // size
+                peaks = np.abs(samples[:n * size]).max(axis=1).reshape(n, size).max(axis=1)
+            except Exception:
+                peaks = np.zeros(0, np.float32)
+            self._peaks[rel] = peaks
+        return self._peaks[rel]
+
+    def draw_waveform(self, c, clip, x0, vx0, vx1, top, color, scale):
+        """The clip's shape, drawn to its loudest part, so quiet sounds are still readable."""
+        peaks = self.clip_peaks(clip["file"])
+        if len(peaks) == 0:
+            return
+        half, mid, loudest = (LANE_H - 8) / 2, top + LANE_H // 2, float(peaks.max()) or 1.0
+        for x in range(int(vx0), int(vx1)):
+            seconds = clip["trim"] + (x - x0) / scale
+            a = int(peaks[clamp(int(seconds * PEAKS_PER_SECOND), 0, len(peaks) - 1)] / loudest * half)
+            c[mid - a:mid + a + 1, x] = color
+
+    def draw_sound_lanes(self, c, mode):
+        p = self.project
+        scale = self.sound_scale()
+        visible = (LANE_X1 - LANE_X0) / scale
+        self.sound_at = clamp(self.sound_at, 0.0, max(0.0, self.sound_span() - visible))
+        # The ruler, with zoom buttons.
+        self.draw_button(c, (8, SOUND_Y, 38, SOUND_Y + RULER_H), "-", action=("sound_zoom", -1), scale=0.5,
+                         align="center")
+        self.draw_button(c, (42, SOUND_Y, 72, SOUND_Y + RULER_H), "+", action=("sound_zoom", 1), scale=0.5,
+                         align="center")
+        put_text(c, "SOUND", (84, SOUND_Y + RULER_H - 5), 0.4, C_DIM, 1, UI_BOLD)
+        step = next((k for k in (0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600) if k * scale >= 60), 600)
+        t = math.ceil(self.sound_at / step) * step
+        while t <= self.sound_at + visible:
+            x = self.x_of(t)
+            cv2.line(c, (x, SOUND_Y + RULER_H - 5), (x, SOUND_Y + RULER_H), C_DIM, 1)
+            put_text(c, clock_text(t), (x + 3, SOUND_Y + RULER_H - 5), 0.38, C_DIM)
+            t += step
+        # The track lanes, with their names and buttons.
+        for i, track in enumerate(p.tracks):
+            top = self.lane_top(i)
+            color = TRACK_COLORS[i] if not track["muted"] else C_DIM
+            fill_rect(c, LANE_X0, top, LANE_X1, top + LANE_H, (46, 40, 38))
+            self.hotspots.append(((LANE_X0, top, LANE_X1, top + LANE_H), ("lane", i)))
+            put_text(c, track["name"], (10, top + LANE_H // 2), 0.5, color, 1, UI_BOLD, valign="middle")
+            self.draw_button(c, (62, top, 110, top + LANE_H), f"{track['volume']}%", action=("track_volume", i),
+                             scale=0.42, align="center")
+            self.draw_button(c, (116, top, 160, top + LANE_H), "Mute", action=("track_mute", i), scale=0.42,
+                             align="center", active=track["muted"])
+        # The clips, where they'd be if a drag let go now.
+        drag = self.sound_drag if self.sound_drag is not None and self.sound_drag["moved"] else None
+        placed = []
+        for i, track in enumerate(p.tracks):
+            for clip in track["clips"]:
+                target = i
+                if drag is not None and drag["id"] == clip["id"]:
+                    new = self.sound_edit(drag, drag["x"], drag["y"])
+                    clip = dict(clip, start=new["start"], trim=new["trim"], length=new["length"])
+                    target = new["track"]
+                placed.append((target, clip))
+        for i, clip in placed:
+            x0, x1 = self.x_of(clip["start"]), self.x_of(clip["start"] + clip["length"])
+            vx0, vx1 = max(x0, LANE_X0), min(x1, LANE_X1)
+            if vx1 <= vx0:
+                continue
+            top = self.lane_top(i)
+            color = TRACK_COLORS[i] if not p.tracks[i]["muted"] else C_DIM
+            round_rect(c, vx0, top, vx1, top + LANE_H, tuple(v // 3 for v in color), 5)
+            self.draw_waveform(c, clip, x0, vx0, vx1, top, color, scale)
+            put_text(c, fit_text(clip["name"], vx1 - vx0 - 10, 0.4, UI_BOLD), (vx0 + 6, top + LANE_H // 2), 0.4,
+                     WHITE, 1, UI_BOLD, valign="middle")
+            selected = self.sound_sel == (i, clip["id"])
+            cv2.rectangle(c, (int(vx0), top), (int(vx1), top + LANE_H), C_YELLOW if selected else color,
+                          2 if selected else 1)
+            self.hotspots.append(((int(vx0), top, int(vx1), top + LANE_H), ("clip", i, clip["id"])))
+            if x0 >= LANE_X0:
+                self.hotspots.append(((int(x0), top, int(x0) + 8, top + LANE_H), ("clip-left", i, clip["id"])))
+            if x1 <= LANE_X1:
+                self.hotspots.append(((int(x1) - 8, top, int(x1), top + LANE_H), ("clip-right", i, clip["id"])))
+        # Where the movie is (while it plays), or where new sounds will go.
+        if self.playhead is not None:
+            x, line, thick = self.x_of(self.playhead), WHITE, 2
+        else:
+            x, line, thick = self.x_of(self.sound_here()), C_YELLOW, 1
+        if LANE_X0 <= x <= LANE_X1:
+            cv2.line(c, (x, SOUND_Y + RULER_H), (x, SOUND_BOTTOM), line, thick)
+
+    # -- moving, trimming, copying and deleting sounds
+
+    def find_clip(self, track, cid):
+        for clip in self.project.tracks[track]["clips"]:
+            if clip["id"] == cid:
+                return clip
+        return None
+
+    def locate(self, cid):
+        """(track, clip) for a clip id, or (None, None)."""
+        for i, track in enumerate(self.project.tracks):
+            for clip in track["clips"]:
+                if clip["id"] == cid:
+                    return i, clip
+        return None, None
+
+    def sound_press(self, action, x, y):
+        kind, track, cid = action
+        _, clip = self.locate(cid)
+        if clip is None:
+            return
+        self.sound_sel = (track, cid)
+        mode = {"clip": "move", "clip-left": "left", "clip-right": "right"}[kind]
+        self.sound_drag = {"mode": mode, "track": track, "id": cid, "x0": x, "x": x, "y0": y, "y": y,
+                           "moved": False, "start": clip["start"], "trim": clip["trim"],
+                           "length": clip["length"], "source": clip["source"]}
+
+    def sound_edit(self, drag, x, y):
+        """Where a clip would be if the drag let go at (x, y): its start, trim, length and track."""
+        dt = (x - drag["x0"]) / self.sound_scale()
+        start0, trim0, length0, source = drag["start"], drag["trim"], drag["length"], drag["source"]
+        if drag["mode"] == "move":
+            start = round(round(max(0.0, start0 + dt) / SNAP_SECONDS) * SNAP_SECONDS, 3)
+            return {"start": start, "trim": trim0, "length": length0, "track": self.lane_at(y, drag["track"])}
+        if drag["mode"] == "left":                  # the start moves; the sound stays where it was
+            delta = clamp(dt, max(-trim0, -start0), length0 - MIN_CLIP_SECONDS)
+            return {"start": round(start0 + delta, 3), "trim": round(trim0 + delta, 3),
+                    "length": round(length0 - delta, 3), "track": drag["track"]}
+        length = clamp(length0 + dt, MIN_CLIP_SECONDS, source - trim0)     # the end moves
+        return {"start": start0, "trim": trim0, "length": round(length, 3), "track": drag["track"]}
+
+    def sound_release(self, x, y):
+        drag, self.sound_drag = self.sound_drag, None
+        if drag is None or not drag["moved"]:
+            return
+        new = self.sound_edit(drag, x, y)
+        i, clip = self.locate(drag["id"])
+        if clip is None:
+            return
+        with self.project.change(self.ui_state()):
+            clip.update(start=new["start"], trim=new["trim"], length=new["length"])
+            if new["track"] != i:
+                tracks = self.project.tracks
+                tracks[i]["clips"] = [c for c in tracks[i]["clips"] if c is not clip]
+                tracks[new["track"]]["clips"].append(clip)
+        self.sound_sel = (new["track"], drag["id"])
+
+    def delete_sound(self):
+        track, cid = self.sound_sel
+        clip = self.find_clip(track, cid)
+        self.sound_sel = None
+        if clip is None:
+            return
+        with self.project.change(self.ui_state()):
+            self.project.tracks[track]["clips"] = [c for c in self.project.tracks[track]["clips"] if c is not clip]
+        self.toast(f"Deleted '{clip['name']}'. Press Z to undo.")
+
+    def copy_sound(self):
+        track, cid = self.sound_sel
+        clip = self.find_clip(track, cid)
+        if clip is None:
+            self.sound_sel = None
+            return
+        copy = dict(clip, id=new_id(), start=round(clip["start"] + clip["length"], 3))
+        with self.project.change(self.ui_state()):
+            self.project.tracks[track]["clips"].append(copy)
+        self.sound_sel = (track, copy["id"])
+        self.toast(f"Copied '{clip['name']}'. The copy is just after it.")
+
+    def track_mute(self, i):
+        track = self.project.tracks[i]
+        with self.project.change(self.ui_state()):
+            track["muted"] = not track["muted"]
+        self.toast(f"{track['name']} is {'muted' if track['muted'] else 'back on'}.")
+
+    def track_volume(self, i):
+        track = self.project.tracks[i]
+        steps = (100, 50, 150)
+        nxt = steps[(steps.index(track["volume"]) + 1) % len(steps)] if track["volume"] in steps else 100
+        with self.project.change(self.ui_state()):
+            track["volume"] = nxt
+        self.toast(f"{track['name']} at {nxt}% volume.")
+
     def draw_camera_tile(self, c, x, y, mode):
-        if self.live is not None and mode in ("live", "review"):
+        if self.live is not None and mode in ("live", "review", "recording"):
             c[y:y + TILE_H, x:x + TILE_W] = darken(fit_image(self.live, (TILE_W, TILE_H), C_DARK), 0.6)
         else:
             fill_rect(c, x, y, x + TILE_W, y + TILE_H, C_DARK)
@@ -3553,7 +4180,7 @@ class App:
                     ("Save S", "save"), ("Camera K", "camera")]
 
     def draw_edit_row(self, c, mode):
-        busy = mode in ("preview", "record", "countdown")
+        busy = mode in ("preview", "record", "countdown", "recording")
         n, gap = len(self.EDIT_BUTTONS), 6
         width = (CANVAS_W - 20 - gap * (n - 1)) / n
         for k, (label, cmd) in enumerate(self.EDIT_BUTTONS):
@@ -3597,6 +4224,7 @@ class App:
         if kind == "down":
             self.drag = None              # in case a button-up got lost
             self.slider_drag = None
+            self.sound_drag = None
             action = self.hit(x, y)
             if action is None:
                 return
@@ -3605,7 +4233,18 @@ class App:
                 self.slide(action[1], x)
             elif action[0] == "camera":
                 self.run_camera(action[1])
+            elif action[0] in ("clip", "clip-left", "clip-right"):
+                self.sound_press(action, x, y)
+            elif action[0] == "lane":
+                self.sound_sel = None
+            elif action[0] == "track_mute":
+                self.track_mute(action[1])
+            elif action[0] == "track_volume":
+                self.track_volume(action[1])
+            elif action[0] == "sound_zoom":
+                self.sound_zoom_by(action[1])
             elif action[0] == "tile":
+                self.sound_sel = None
                 self.set_cursor_pos(action[1])
                 self.drag = {"tile": self.tile_id(action[1]), "x0": x, "x": x, "moved": False}
             elif action[0] == "cmd":
@@ -3628,8 +4267,18 @@ class App:
             if moved and pos is not None:
                 b = self.drop_boundary(x)
                 self.move_tile(pos, b if b <= pos else b - 1)
+        elif kind == "drag" and self.sound_drag is not None:
+            d = self.sound_drag
+            d["x"], d["y"] = x, y
+            if abs(x - d["x0"]) > 3 or abs(y - d["y0"]) > 8:
+                d["moved"] = True
+        elif kind == "up" and self.sound_drag is not None:
+            self.sound_release(x, y)
         elif kind == "wheel":
-            self.tl_first -= event[3]
+            if SOUND_Y <= y < EDIT_Y:              # over the lanes: scroll them
+                self.sound_at -= event[3] * (LANE_X1 - LANE_X0) / self.sound_scale() / 3
+            else:
+                self.tl_first -= event[3]
 
     def run_command(self, name):
         getattr(self, "cmd_" + name)()
@@ -3715,6 +4364,9 @@ class App:
         self.go_live()
 
     def cmd_escape(self):
+        if self.sound_sel is not None:
+            self.sound_sel = None
+            return
         if self.cursor is not None:
             self.cursor = None
         else:
@@ -3729,6 +4381,9 @@ class App:
         self.toast("Press Q again to quit. (Your movie is already saved.)")
 
     def cmd_delete(self):
+        if self.sound_sel is not None:
+            self.delete_sound()
+            return
         i = self.target_index()
         if i is None:
             self.toast("Nothing to delete.")
@@ -3745,6 +4400,9 @@ class App:
         self.toast(f"Deleted {what}. Press Z to undo.")
 
     def cmd_duplicate(self):
+        if self.sound_sel is not None:
+            self.copy_sound()
+            return
         i = self.target_index()
         if i is None:
             self.toast("Pick a picture to copy.")
@@ -3773,6 +4431,9 @@ class App:
             self.toast("Pick a picture first.")
             return
         item, fps = self.project.items[i], self.project.fps
+        if item["kind"] == "live":
+            self.toast("A live video plays for as long as it was recorded.")
+            return
         if item["kind"] == "title":
             step = max(1, fps // 2)
             new = clamp(item["hold"] + delta * step, step, fps * 30)
@@ -3930,6 +4591,12 @@ class App:
     def cmd_record(self):
         self.run_record()
 
+    def cmd_import(self):
+        self.run_import()
+
+    def cmd_live(self):
+        self.run_live()
+
     def cmd_export(self):
         self.run_export()
 
@@ -3938,48 +4605,141 @@ class App:
 
     # -- playing the movie
 
-    def load_audio(self):
-        path = self.project.audio_file()
-        if path is None or sound_module() is None:
-            return None
-        try:
-            return read_wav(path)
-        except Exception as e:            # empty or damaged file
-            print(f"Couldn't read {path}: {e!r}")
-            self.toast(f"Couldn't read the voice track: {e}", "error")
-            return None
-
-    def start_playback(self, audio):
-        if audio is not None:
-            self.speaker.play(*audio)
-        return time.monotonic()
-
     def run_preview(self):
         p = self.project
         plan = build_plan(p)
         if not plan:
             self.toast("Take some pictures first!")
             return
-        audio = self.load_audio()
+        mix = None
+        if p.has_sound():
+            if sound_module() is None:
+                self.toast(sound_problem(), "error", 6)
+            else:
+                mix = SoundMix.from_project(p)
+                if mix.missing:
+                    self.toast("Some sounds couldn't be read, so they're left out.", "error", 6)
         shown, view = -1, None
-        start = self.start_playback(audio)
+        started = time.monotonic()
+        streaming = mix is not None and self.speaker.play(mix, 0.0)
         try:
             while self.running:
-                idx = int((time.monotonic() - start) * p.fps)
+                now = self.speaker.position() if streaming else None
+                if now is None:               # no sound playing: keep time by the clock
+                    now = time.monotonic() - started
+                idx = int(now * p.fps)
                 if idx >= len(plan):          # go round again, like a flip book
                     self.speaker.stop()
-                    start = self.start_playback(audio)
-                    idx = 0
+                    streaming = mix is not None and self.speaker.play(mix, 0.0)
+                    started = time.monotonic()
+                    now, idx = 0.0, 0
                 if idx != shown:
                     view = fit_image(self.renderer.render(plan[idx]), (VIEW_W, VIEW_H))
                     shown = idx
-                c = self.draw_studio(view, "preview", plan_item(plan[idx]), {"progress": (idx + 1) / len(plan)})
+                c = self.draw_studio(view, "preview", plan_item(plan[idx]),
+                                     {"progress": (idx + 1) / len(plan), "time": now})
                 key, events = self.tick(c, 5)
                 if key != -1 or any(e[0] == "down" for e in events):
                     break
         finally:
             self.speaker.stop()
+            self.playhead = None
         self.after_modal()
+
+    def run_import(self):
+        """Add sound files from the file window, on a track the user picks."""
+        p = self.project
+        try:
+            paths = self.file_picker()
+        except RuntimeError as e:
+            self.toast(str(e), "error", 8)
+            return
+        if not paths:
+            self.after_modal()
+            return
+        choice = self.ask_choice(f"Put {plural(len(paths), 'sound')} on which track?",
+                                 [("1", "DLG (1)"), ("2", "SFX (2)"), ("3", "MUSIC (3)")],
+                                 "DLG is for talking, SFX for bangs and sounds, MUSIC for the background.")
+        self.after_modal()
+        if choice is None:
+            return
+        track, start, added, failed = {"1": 0, "2": 1, "3": 2}[choice], self.sound_here(), 0, []
+        with p.change(self.ui_state()):          # one undo for the lot
+            for path in paths:
+                try:
+                    clip = p.import_sound_file(path, track, start)
+                except ValueError as e:
+                    failed.append(str(e))
+                    continue
+                start += clip["length"]
+                added += 1
+        if added:
+            text = f"Added {plural(added, 'sound')} to {p.tracks[track]['name']}."
+            self.toast(text + (f" {failed[0]}" if failed else ""), "info" if failed else "good", 5)
+        else:
+            self.toast(failed[0] if failed else "No sounds were added.", "error", 8)
+
+    def run_live(self):
+        """Record the camera's video with the microphone's sound, until G (or a click) stops it."""
+        p = self.project
+        if self.live is None:
+            self.toast("The camera isn't ready yet.", "error")
+            return
+        size = even_size(*p.size)
+        video_rel = f"{LIVE_DIR}/live {now_stamp()}.mp4"
+        video_path = p.file_path(video_rel)
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = open_video_writer(video_path, LIVE_FPS, size)
+        if writer is None:
+            self.toast("Couldn't start recording video. Installing ffmpeg usually fixes this.", "error", 8)
+            return
+        recorder = None
+        problem = sound_problem()
+        if problem:
+            self.toast(problem + "  The video will have no sound.", "error", 8)
+        else:
+            recorder = self.recorder_factory()
+            try:
+                recorder.start()
+            except Exception as e:
+                print(f"Couldn't start the microphone: {e}")
+                self.toast(f"No sound: couldn't start the microphone ({e}).", "error", 6)
+                recorder = None
+        start, written, view = time.monotonic(), 0, None
+        try:
+            while self.running:
+                elapsed = time.monotonic() - start
+                if elapsed > MAX_LIVE_SECONDS:
+                    break
+                self.read_camera()
+                if self.live is not None:
+                    frame = fill_image(self.live, size)
+                    # Keep the video in step with the clock: a slow camera repeats its last picture.
+                    for _ in range(min(int(elapsed * LIVE_FPS) - written, LIVE_FPS)):
+                        writer.write(frame)
+                        written += 1
+                    view = fit_image(frame, (VIEW_W, VIEW_H))
+                c = self.draw_studio(view, "recording", None,
+                                     {"elapsed": elapsed, "level": recorder.level if recorder else 0.0})
+                key, events = self.tick(c, 1)
+                if key != -1 or any(e[0] == "down" for e in events):
+                    break
+        finally:
+            writer.release()
+            samples, rate = recorder.stop() if recorder is not None else (None, None)
+        self.after_modal()
+        if written == 0:
+            video_path.unlink(missing_ok=True)
+            self.toast("Nothing was recorded.", "error")
+            return
+        seconds = written / LIVE_FPS
+        audio_rel = None
+        if samples is not None and len(samples) and rate and np.abs(samples).max() > 0:
+            audio_rel = p.save_recording(samples, rate, folder=AUDIO_DIR, stem="live sound")
+        with p.change(self.ui_state()):
+            p.add_live(self.insert_at, video_rel, audio_rel, seconds)
+        self.insert_at += 1
+        self.toast(f"Live video added ({seconds:.1f} s)" + ("" if audio_rel else ", with no sound") + ".", "good", 5)
 
     # -- recording a voice track
 
@@ -3990,16 +4750,6 @@ class App:
             self.toast(problem, "error", 8)
             return
         p = self.project
-        if p.audio_file():
-            choice = self.ask_choice("You already have a voice track.",
-                                     [("r", "Record new (R)"), ("x", "Delete it (X)"), ("esc", "Keep it (ESC)")])
-            if choice == "x":
-                with p.change(self.ui_state()):
-                    p.doc["audio"] = None
-                self.toast("Voice track deleted. Press Z to undo.")
-            if choice != "r":
-                self.after_modal()
-                return
         plan = build_plan(p)
         first_view = fit_image(self.renderer.render(plan[0]), (VIEW_W, VIEW_H)) if plan else None
         start = time.monotonic()
@@ -4060,12 +4810,13 @@ class App:
             print(msg)
             self.toast(msg, "error", 10)
             return
-        with p.change(self.ui_state()):
-            p.set_audio(samples, rate)
         seconds = len(samples) / rate
         quiet = "  It was very quiet - try talking closer to the computer." if peak < 1000 else ""
-        print(f"Recorded {seconds:.1f} s of voice: {p.audio_file()}")
-        self.toast(f"Voice recorded ({seconds:.1f} s)! Press P to hear it with the movie.{quiet}", "good", 6)
+        with p.change(self.ui_state()):
+            rel = p.save_recording(samples, rate)
+            p.add_sound(0, rel, 0.0, seconds, "voice")
+        print(f"Recorded {seconds:.1f} s of voice: {rel}")
+        self.toast(f"Voice recorded on DLG ({seconds:.1f} s)! Press P to hear it with the movie.{quiet}", "good", 6)
 
     # -- title cards
 

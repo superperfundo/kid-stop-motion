@@ -21,8 +21,10 @@ It's one Python file. No accounts, no cloud, no uploads: everything stays on you
 - **Title cards.** Type the words right in the window and pick from six color styles.
 - **Transitions.** Put a Fade, Melt, Wipe, Circle or Slide before any picture, or at the very
   end of the movie.
-- **A voice track.** Press `R` and talk while the movie plays: the microphone records a scratch
-  track that plays with the movie and goes into the MP4.
+- **Three sound tracks: DLG, SFX and MUSIC.** Add sound files (`I`), record your voice (`R`), or
+  record live video with its sound (`G`). Drag the clips to move them, trim their ends, copy or
+  delete them, and mute or turn down a whole track. The movie plays with all of it and the MP4
+  gets the mix.
 - **Auto-snap, a picture goal and a speed control.** `T` takes a picture every 2 seconds, `N`
   sets a goal with a progress bar, `V` makes the movie faster or slower.
 - **A steady picture.** In the camera panel (`K`), lock focus, exposure and white balance so the
@@ -44,7 +46,7 @@ That installs OpenCV, [sounddevice](https://python-sounddevice.readthedocs.io/) 
 microphone, and on macOS a ready-built libusb for the camera controls. If sounddevice isn't there,
 everything except sound still works.
 
-[ffmpeg](https://ffmpeg.org/) is optional but recommended: it's what puts your voice track into
+[ffmpeg](https://ffmpeg.org/) is optional but recommended: it's what puts the sound into
 the MP4. Without it, OpenCV's built-in encoder makes the movie, without sound. To install it on
 macOS with [Homebrew](https://brew.sh/): `brew install ffmpeg`. On Debian/Ubuntu:
 `sudo apt install ffmpeg libportaudio2` (the second one is for the microphone).
@@ -65,12 +67,14 @@ camera, press `K` then `C`.
 | Key | What it does |
 | --- | --- |
 | `SPACE` | Take a picture. (If you're looking at an old picture, the first press moves the camera there.) |
-| `P` | Play the movie with its voice track (any key stops it) |
+| `P` | Play the movie with all its sound (any key stops it) |
 | `O` | Ghost of the last picture on / off |
 | `T` | Auto-snap: a picture every 2 seconds |
 | `C` | Add a title card (or edit the one you picked) |
 | `F` | Transition before the picked picture. Press again for the next kind. With the camera at the end, it's the ending. |
-| `R` | Record a voice track |
+| `R` | Record your voice, onto the DLG track from the start of the movie |
+| `I` | Add sound files (WAV, MP3, M4A and more with ffmpeg), on the track you pick |
+| `G` | Live: record the camera's video with its sound. Press `G` again to stop. |
 | `V` | Speed: pictures per second |
 | `E` | Make an MP4 movie |
 | `L` | Your movies: open another one, or start a new one |
@@ -100,7 +104,8 @@ Stop Motion Projects/
     Open Dragon Race.command    <- double-click to open it (.bat on Windows, .sh on Linux)
     Dragon Race 2026-09-29 16-20-05.mp4   <- movies you made
     frames/                     <- every picture
-    audio/                      <- the voice track
+    audio/                      <- the sounds on the tracks (as WAV files)
+    live/                       <- live recordings (video)
     backups/                    <- older copies of the project file
     trash/                      <- pictures you deleted, just in case
 ```
@@ -146,7 +151,7 @@ Stop Motion Projects/
   python3 stopmotion.py --export "~/Stop Motion Projects/Dragon Race"   # make the MP4, no camera needed
   ```
 
-## Title cards, transitions and the voice track
+## Title cards, transitions and sound
 
 - **Title cards:** press `C` and type. The first line is big; `TAB` starts a smaller line under
   it (up to three). `LEFT` / `RIGHT` changes the colors, `ENTER` is done. A new card lasts two
@@ -155,10 +160,32 @@ Stop Motion Projects/
 - **Transitions** go *before* a picture: pick the picture and press `F` until you like it (Fade,
   Melt, Wipe, Circle, Slide, then none). A transition before the very first picture fades the
   movie in. With the camera at the end of the timeline, `F` sets how the movie ends.
-- **Voice track:** press `R`. After a 3-2-1 countdown the movie plays silently while you talk,
-  and recording stops when the movie ends (or when you press any key). With no pictures yet, it
+- **Voice:** press `R`. After a 3-2-1 countdown the movie plays silently while you talk, and
+  recording stops when the movie ends (or when you press any key). With no pictures yet, it
   records until you press a key, which is handy for recording the lines first and animating to
-  them. Press `R` again to record a new one or delete it. `Z` undoes either.
+  them. The voice goes on the DLG track, from the start of the movie. `Z` undoes it.
+- **Sound tracks:** the three lanes under the pictures are DLG (talking), SFX (bangs and
+  sounds) and MUSIC (background). Each sound is a clip you can:
+  - **Add** with `I`: a window opens to pick files (from Finder or Explorer), then you choose the
+    track. New sounds start where the picked picture is, or where the camera is.
+  - **Move** by dragging it, along the lane or onto another track. It snaps to a tenth of a second.
+  - **Trim** by dragging its left or right edge: the sound starts or stops later or earlier.
+  - **Pick** by clicking it (it outlines in yellow). `D` copies it (the copy goes just after it),
+    `X` deletes it, and `Z` undoes either. Clicking a picture picks that instead.
+  - **Mute** a whole track with its `Mute` button, or turn it down or up with the percentage
+    button (100%, 50%, 150%).
+  - **See** more by zooming with `+` / `-` above the lanes, and scrolling the mouse wheel over them.
+  The white line in the lanes is where the movie is while it plays; the yellow line is where new
+  sounds will go. Playing the movie (`P`) plays every track at once, and the white line follows
+  the sound as it's heard.
+- **Live video:** press `G` to record what the camera sees, with the microphone's sound, when
+  stop motion won't do (a bit of talking, a dance, a surprise). It goes into the timeline as one
+  picture, labelled "live", and plays for as long as it was recorded (up to five minutes). Its
+  sound moves with it. Live video plays at the movie's speed (`V`), so a movie with live parts
+  reads best at 24 or more pictures a second.
+- **Not yet:** dragging files straight from Finder or Explorer onto the window. Use `I`, which
+  opens the same kind of window. The studio is drawn in an OpenCV window, which doesn't accept
+  dropped files, so dragging needs platform-specific code that isn't written yet.
 
 ## Focus, exposure and white balance
 
@@ -261,8 +288,9 @@ Near the top of `stopmotion.py`:
 - `PROJECTS_DIR`: where new movies go (or run with `--projects-dir some/folder`).
 - `ONION_OPACITY`, `AUTO_CAPTURE_SECONDS`, `TITLE_SECONDS`, `TRANSITION_SECONDS`,
   `SHUTTER_SOUND`.
-- `WINDOW_SCALE = 1.0`: the window is 1280 x 776. Try `0.8` on a small screen (or run
-  `python3 stopmotion.py --scale 0.8`).
+- `WINDOW_SCALE = 1.0`: the window is 1280 x 900 (the sound lanes make it taller than before).
+  Try `0.8` on a small screen (or run `python3 stopmotion.py --scale 0.8`).
+- `MAX_LIVE_SECONDS = 300`: the longest live video `G` records, in seconds.
 
 ## Camera and microphone permissions
 
@@ -288,8 +316,9 @@ if you version your own animation projects you don't accidentally publish footag
 python3 -m unittest discover -s tests
 ```
 
-The tests drive the whole studio with a pretend camera and window, so they don't need a webcam
-or a screen.
+The tests drive the whole studio with a pretend camera, window and sound, so they don't need a
+webcam, a screen or a speaker. Sound playback itself (the speakers, and the timing of the white
+line against the sound) has only been tried with a pretend sound device.
 
 ## License
 

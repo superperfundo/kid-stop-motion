@@ -178,12 +178,18 @@ class FakeRecorder:
 
 
 class FakeSpeaker:
+    """Records what would have been played; no sound device needed. position() is
+    None, as if the sound isn't streaming, so the preview keeps time by the clock."""
+
     def __init__(self):
         self.played = []
 
-    def play(self, samples, rate):
-        self.played.append((len(samples), rate))
+    def play(self, mix, seconds):
+        self.played.append(seconds)
         return True
+
+    def position(self):
+        return None
 
     def stop(self):
         pass
